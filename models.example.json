@@ -1,0 +1,46 @@
+[
+  {
+    "id": "acc-example01",
+    "key_ref": "aihub.models.acc-example01",
+    "key_hint": "",
+    "vendor": "OpenAI",
+    "base_url": "https://api.openai.com/v1",
+    "protocol": "openai",
+    "models": [
+      {
+        "name": "gpt-5.2",
+        "model_id": "gpt-5.2",
+        "caps": {
+          "vision": true,
+          "tools": true,
+          "code": "strong",
+          "speed": "normal",
+          "price": "high",
+          "context": 400000
+        }
+      }
+    ]
+  },
+  {
+    "id": "acc-example02",
+    "key_ref": "aihub.models.acc-example02",
+    "key_hint": "",
+    "vendor": "Anthropic",
+    "base_url": "https://api.anthropic.com",
+    "protocol": "anthropic",
+    "models": [
+      {
+        "name": "claude-sonnet-4.8",
+        "model_id": "claude-sonnet-4-8",
+        "caps": {
+          "vision": true,
+          "tools": true,
+          "code": "strong",
+          "speed": "fast",
+          "price": "normal",
+          "context": 200000
+        }
+      }
+    ]
+  }
+]

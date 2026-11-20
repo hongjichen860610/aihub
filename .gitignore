@@ -1,0 +1,36 @@
+# ---- 本机运行数据：包含账号引用与本机绝对路径，禁止提交 ----
+models.json
+projects.json
+projects.runtime.json
+envs.json
+ai_tools.json
+custom_tools.json
+clis.json
+.cli-backups/
+logs/
+uploads/
+
+# ---- 系统与缓存 ----
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+
+# ---- 编辑器与工具目录 ----
+.trae/
+.trae-html-share-packages/
+.vscode/
+.idea/
+
+# ---- 本地临时文件 ----
+*.local.json
+
+# ---- 分析与设计过程文档（不随功能代码提交）----
+AIHUB-*.md
+
+# ---- 备份 / 快照 / 工具数据 ----
+*.bak
+aihub.py.snapshot-*
+.workbuddy/

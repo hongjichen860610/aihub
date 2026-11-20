@@ -1,0 +1,20 @@
+[
+  {
+    "id": "p-example01",
+    "name": "api",
+    "path": "/Users/you/Projects/demo-shop/api",
+    "start": "npm run dev",
+    "port": 3000,
+    "type": "Node",
+    "admin": ""
+  },
+  {
+    "id": "p-example02",
+    "name": "web",
+    "path": "/Users/you/Projects/demo-shop/web",
+    "start": "npm run dev",
+    "port": 5173,
+    "type": "Node",
+    "admin": "/admin"
+  }
+]

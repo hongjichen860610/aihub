@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Hub · 配色方案对比板</title>
+<style>
+  :root{ --board-bg:#EDEDEA; --board-panel:#FFFFFF; --board-text:#1C1C1A; --board-sub:#6E6E68; --board-line:#DCDCD6; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:var(--board-bg); color:var(--board-text);
+        font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+  .board{ max-width:1180px; margin:0 auto; padding:28px 24px 60px; }
+  h1{ font-size:21px; margin:0 0 4px; letter-spacing:-.02em; }
+  .sub{ color:var(--board-sub); font-size:13px; margin:0 0 22px; }
+  .diag{ background:#FFF8F1; border:1px solid #F0DCC4; border-radius:10px; padding:14px 18px; margin-bottom:24px; font-size:13px; color:#6B4E2E; }
+  .diag b{ color:#8A5A22; }
+
+  /* 方案选择 */
+  .schemes{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:20px; }
+  .scheme{ background:var(--board-panel); border:1.5px solid var(--board-line); border-radius:10px; padding:13px 13px 12px; cursor:pointer; text-align:left; transition:border-color .15s, transform .15s; }
+  .scheme:hover{ transform:translateY(-2px); }
+  .scheme.sel{ border-color:var(--board-text); }
+  .scheme .nm{ font-weight:650; font-size:13.5px; display:flex; align-items:center; gap:7px; }
+  .scheme .tag{ font-size:10.5px; font-weight:500; color:var(--board-sub); background:var(--board-bg); padding:1px 7px; border-radius:20px; }
+  .scheme .mood{ font-size:11.5px; color:var(--board-sub); margin:3px 0 10px; min-height:32px; }
+  .swatches{ display:flex; gap:4px; }
+  .swatches i{ height:22px; flex:1; border-radius:4px; border:1px solid rgba(0,0,0,.07); }
+
+  /* 预览卡 */
+  .stage{ background:var(--board-panel); border:1px solid var(--board-line); border-radius:12px; overflow:hidden; }
+  .stage-head{ display:flex; align-items:center; padding:12px 18px; border-bottom:1px solid var(--board-line); gap:12px; }
+  .stage-head .lab{ font-size:11px; color:var(--board-sub); }
+  .stage-head .cur{ font-size:13.5px; font-weight:650; }
+  .stage-head .why{ margin-left:auto; font-size:12px; color:var(--board-sub); }
+
+  /* ===== 被预览的界面：变量随 data-scheme 切换 ===== */
+  .preview{ --bg:#FAFAFA; --panel:#FFFFFF; --soft:#F4F4F5; --text:#18181B; --sub:#71717A; --faint:#A1A1AA; --line:#E4E4E7; --ink:#18181B; --ok:#15803D; --oksoft:#E8F5EC; --off:#A1A1AA;
+            background:var(--bg); color:var(--text); padding:0 0 26px; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+  .preview[data-scheme="slate"]{ --bg:#F8FAFC; --panel:#FFFFFF; --soft:#F1F5F9; --text:#0F172A; --sub:#64748B; --faint:#94A3B8; --line:#E2E8F0; --ink:#4338CA; --ok:#059669; --oksoft:#E8F6F0; --off:#94A3B8; }
+  .preview[data-scheme="stone"]{ --bg:#FAF9F7; --panel:#FFFFFF; --soft:#F5F5F4; --text:#1C1917; --sub:#78716C; --faint:#A8A29E; --line:#E7E5E4; --ink:#1C1917; --ok:#146356; --oksoft:#E8F1EE; --off:#A8A29E; }
+  .preview[data-scheme="graphite"]{ --bg:#0F1115; --panel:#181B21; --soft:#22262E; --text:#E7E9EE; --sub:#9BA3B4; --faint:#6B7484; --line:#2A2F3A; --ink:#E7E9EE; --ok:#34D399; --oksoft:#133028; --off:#6B7484; }
+
+  .pv-top{ height:52px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:22px; padding:0 20px; }
+  .pv-brand{ font-weight:650; font-size:14px; display:flex; align-items:center; gap:8px; }
+  .pv-mark{ width:18px; height:18px; border-radius:5px; background:var(--ink); display:flex; align-items:center; justify-content:center; }
+  .pv-mark b{ font-size:11px; color:var(--panel); }
+  .pv-tabs{ display:flex; gap:2px; }
+  .pv-tab{ font-size:12.5px; padding:6px 12px; border-radius:6px; color:var(--sub); }
+  .pv-tab.on{ background:var(--soft); color:var(--text); font-weight:600; }
+  .pv-health{ margin-left:auto; font-size:11.5px; color:var(--sub); display:flex; align-items:center; gap:6px; }
+  .pv-health i{ width:6px; height:6px; border-radius:50%; background:var(--ok); }
+
+  .pv-body{ padding:24px 24px 0; }
+  .pv-h1{ font-size:20px; font-weight:680; letter-spacing:-.02em; margin:0; }
+  .pv-desc{ font-size:12.5px; color:var(--sub); margin:2px 0 20px; }
+  .pv-actions{ float:right; margin-top:-32px; display:flex; gap:8px; }
+  .pv-grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; clear:both; }
+  .pv-card{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:15px 16px 12px; }
+  .pv-top-row{ display:flex; align-items:center; gap:8px; }
+  .pv-name{ font-weight:650; font-size:14px; }
+  .pv-tag{ font-size:10.5px; color:var(--sub); background:var(--soft); padding:1px 7px; border-radius:5px; }
+  .pv-status{ margin-left:auto; font-size:11.5px; display:flex; align-items:center; gap:6px; color:var(--off); }
+  .pv-status i{ width:7px; height:7px; border-radius:50%; background:var(--off); }
+  .pv-status.on{ color:var(--ok); } .pv-status.on i{ background:var(--ok); }
+  .pv-path{ font:11px ui-monospace,Menlo,monospace; color:var(--faint); margin-top:6px; }
+  .pv-cmd{ margin-top:11px; background:var(--soft); border-radius:6px; padding:6px 9px; font:11.5px ui-monospace,Menlo,monospace; color:var(--sub); }
+  .pv-acts{ display:flex; align-items:center; gap:6px; margin-top:12px; padding-top:11px; border-top:1px solid var(--line); }
+  .pv-btn{ font-size:11.5px; padding:5px 11px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--text); }
+  .pv-btn.solid{ background:var(--ink); border-color:var(--ink); color:var(--panel); font-weight:600; }
+  .pv-link{ font-size:11.5px; color:var(--sub); background:none; border:0; }
+  .pv-minor{ margin-left:auto; display:flex; gap:6px; }
+
+  /* 色值 tokens */
+  .tokens{ margin:16px 18px 18px; background:#12141A; color:#C9D1E0; border-radius:9px; padding:14px 16px; font:12px/1.9 ui-monospace,Menlo,monospace; overflow:auto; }
+  .tokens .k{ color:#7DD3A8; } .tokens .v{ color:#E7B98A; } .tokens .c{ color:#6B7484; }
+  .hint{ font-size:12px; color:var(--board-sub); margin-top:14px; }
+  @media(max-width:900px){ .schemes{ grid-template-columns:repeat(2,1fr); } .pv-grid{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="board">
+  <h1>配色方案对比板</h1>
+  <p class="sub">同一套界面 · 四套配色 · 点上方方案卡实时切换。色阶取自 Tailwind / Radix 公开色板，可追溯。</p>
+
+  <div class="diag">
+    <b>当前配色的问题：</b>① 米灰底与白卡明度差仅约 3%，界面发平；② 翠绿饱和度高，像后台模板而非专业工具；③ 纯黑按钮过硬、无灰度过渡；④ 颜色是零散色值，没有统一色阶。
+  </div>
+
+  <div class="schemes" id="schemes">
+    <button class="scheme sel" data-scheme="mono">
+      <div class="nm">极简单色 <span class="tag">最高级</span></div>
+      <div class="mood">黑白灰，靠层次和留白取胜。最克制、最不会出错。</div>
+      <div class="swatches"><i style="background:#FAFAFA"></i><i style="background:#F4F4F5"></i><i style="background:#E4E4E7"></i><i style="background:#71717A"></i><i style="background:#18181B"></i><i style="background:#15803D"></i></div>
+    </button>
+    <button class="scheme" data-scheme="slate">
+      <div class="nm">冷石板 + 靛蓝 <span class="tag">专业感</span></div>
+      <div class="mood">冷调灰底 + 靛紫强调。Linear / Vercel 那类开发者工具的质感。</div>
+      <div class="swatches"><i style="background:#F8FAFC"></i><i style="background:#F1F5F9"></i><i style="background:#E2E8F0"></i><i style="background:#64748B"></i><i style="background:#4338CA"></i><i style="background:#059669"></i></div>
+    </button>
+    <button class="scheme" data-scheme="stone">
+      <div class="nm">暖石 + 墨绿 <span class="tag">稳重</span></div>
+      <div class="mood">保留你原来的暖调，把翠绿换成沉稳墨绿。改动最小、提升明显。</div>
+      <div class="swatches"><i style="background:#FAF9F7"></i><i style="background:#F5F5F4"></i><i style="background:#E7E5E4"></i><i style="background:#78716C"></i><i style="background:#1C1917"></i><i style="background:#146356"></i></div>
+    </button>
+    <button class="scheme" data-scheme="graphite">
+      <div class="nm">石墨深空 <span class="tag">深色工具</span></div>
+      <div class="mood">深色层次出质感。适合长时间盯着的本地控制台。</div>
+      <div class="swatches"><i style="background:#0F1115"></i><i style="background:#181B21"></i><i style="background:#2A2F3A"></i><i style="background:#6B7484"></i><i style="background:#9BA3B4"></i><i style="background:#34D399"></i></div>
+    </button>
+  </div>
+
+  <div class="stage">
+    <div class="stage-head">
+      <span class="lab">实时预览</span>
+      <span class="cur" id="curName">极简单色</span>
+      <span class="why" id="curWhy">靠灰阶层次撑起质感，无彩色干扰</span>
+    </div>
+
+    <div class="preview" id="pv" data-scheme="mono">
+      <div class="pv-top">
+        <div class="pv-brand"><span class="pv-mark"><b>A</b></span>AI Hub</div>
+        <div class="pv-tabs"><span class="pv-tab on">项目</span><span class="pv-tab">模型</span><span class="pv-tab">工具</span></div>
+        <div class="pv-health"><i></i>本机服务正常</div>
+      </div>
+      <div class="pv-body">
+        <h1 class="pv-h1">项目</h1>
+        <p class="pv-desc">你在本机管理的服务</p>
+        <div class="pv-actions"><button class="pv-btn">重新扫描</button><button class="pv-btn solid">＋ 添加项目</button></div>
+        <div class="pv-grid">
+          <article class="pv-card">
+            <div class="pv-top-row"><span class="pv-name">api</span><span class="pv-tag">Node</span><span class="pv-status"><i></i>已停止</span></div>
+            <div class="pv-path">~/ai_coding/opengym/api</div>
+            <div class="pv-cmd">启动命令&nbsp; npm start</div>
+            <div class="pv-acts"><button class="pv-btn solid">启动</button><span class="pv-minor"><button class="pv-link">日志</button><button class="pv-link">编辑</button></span></div>
+          </article>
+          <article class="pv-card">
+            <div class="pv-top-row"><span class="pv-name">crown111</span><span class="pv-tag">Python</span><span class="pv-status on"><i></i>运行中</span></div>
+            <div class="pv-path">~/Applications/crown111</div>
+            <div class="pv-cmd">启动命令&nbsp; python3 scrape_live.py --web</div>
+            <div class="pv-acts"><button class="pv-btn solid">打开 :8000</button><button class="pv-btn">停止</button><span class="pv-minor"><button class="pv-link">日志</button><button class="pv-link">编辑</button></span></div>
+          </article>
+        </div>
+      </div>
+    </div>
+
+    <div class="tokens" id="tokens"></div>
+  </div>
+  <p class="hint">选中方案后告诉我编号，我把它套进 <b>aihub-redesign.html</b>，确认后再落进 <b>aihub.py</b> 的三个页面常量。色值可整段复制。</p>
+</div>
+
+<script>
+  const DATA = {
+    mono:{ name:'极简单色', why:'靠灰阶层次撑起质感，无彩色干扰', vars:{
+      '--bg':'#FAFAFA','--panel':'#FFFFFF','--soft':'#F4F4F5','--text':'#18181B','--sub':'#71717A','--faint':'#A1A1AA','--line':'#E4E4E7','--ink':'#18181B','--ok':'#15803D','--off':'#A1A1AA'}},
+    slate:{ name:'冷石板 + 靛蓝', why:'冷灰打底，靛蓝强调，开发者工具质感', vars:{
+      '--bg':'#F8FAFC','--panel':'#FFFFFF','--soft':'#F1F5F9','--text':'#0F172A','--sub':'#64748B','--faint':'#94A3B8','--line':'#E2E8F0','--ink':'#4338CA','--ok':'#059669','--off':'#94A3B8'}},
+    stone:{ name:'暖石 + 墨绿', why:'沿用暖调，墨绿替代翠绿，沉稳不跳', vars:{
+      '--bg':'#FAF9F7','--panel':'#FFFFFF','--soft':'#F5F5F4','--text':'#1C1917','--sub':'#78716C','--faint':'#A8A29E','--line':'#E7E5E4','--ink':'#1C1917','--ok':'#146356','--off':'#A8A29E'}},
+    graphite:{ name:'石墨深空', why:'深色分层出高级感，久看不累', vars:{
+      '--bg':'#0F1115','--panel':'#181B21','--soft':'#22262E','--text':'#E7E9EE','--sub':'#9BA3B4','--faint':'#6B7484','--line':'#2A2F3A','--ink':'#E7E9EE','--ok':'#34D399','--off':'#6B7484'}}
+  };
+  const pv = document.getElementById('pv');
+  const tokens = document.getElementById('tokens');
+  function render(k){
+    const d = DATA[k];
+    pv.dataset.scheme = k;
+    document.getElementById('curName').textContent = d.name;
+    document.getElementById('curWhy').textContent = d.why;
+    let html = '<span class="c">/* '+d.name+' · 填入 :root */</span>\n';
+    for(const [key,val] of Object.entries(d.vars)){
+      html += '  <span class="k">'+key+'</span>: <span class="v">'+val+'</span>;\n';
+    }
+    tokens.innerHTML = html;
+    document.querySelectorAll('.scheme').forEach(b => b.classList.toggle('sel', b.dataset.scheme===k));
+  }
+  document.querySelectorAll('.scheme').forEach(b => b.addEventListener('click', ()=>render(b.dataset.scheme)));
+  render('mono');
+</script>
+</body>
+</html>
