@@ -1802,6 +1802,7 @@ def collect_projects():
             "path": path,
             "start": p.get("start") or "",
             "type": p.get("type") or "",
+            "runtime": p.get("runtime"),
             "port": hint,
             "admin": p.get("admin") or "",
             "source": p.get("source") or "",
@@ -2258,19 +2259,35 @@ def _ver_cmp(cur, base, op):
     return cur == base
 
 
+def _compatible_release(cur, num, op):
+    """PEP 440 兼容版本 ~=X.Y (-> >=X.Y,<X+1) 或 ~=X.Y.Z (-> <X.Y+1)。"""
+    if op != "~=":
+        return None
+    base = _ver_tuple(num)
+    if not base or cur < base:
+        return False
+    parts = num.count(".") + 1
+    if parts >= 3:
+        return cur[0] == base[0] and cur[1] == base[1]
+    return cur[0] == base[0]
+
+
 def version_satisfies(version, spec):
     """判断版本是否满足 engines / packageManager 约束，无法判断时返回 None。"""
     cur = _ver_tuple(version)
     if not cur or not str(spec or "").strip():
         return None
     for alt in re.split(r"\|\|", str(spec)):
-        tokens = re.findall(r"(\^|~|>=|<=|>|<|=)?\s*(\d+(?:\.\d+){0,2})", alt)
+        # 支持 ~= / >= / <= / ^ / ~ / > / < / =，逗号或空格分隔的多个约束
+        tokens = re.findall(r"(~=|>=|<=|\^|~|>|<|=)?\s*(\d+(?:\.\d+){0,2})", alt)
         if not tokens:
             continue
         ok = True
         for op, num in tokens:
             base = _ver_tuple(num)
-            if not op or op == "=":
+            if op == "~=":
+                ok = _compatible_release(cur, num, op)
+            elif not op or op == "=":
                 # 只写到主版本/次版本时按前缀匹配，例如 .nvmrc 里写 18 或 18.20
                 parts = num.count(".") + 1
                 ok = cur[:parts] == base[:parts] if parts < 3 else cur == base
@@ -2824,8 +2841,9 @@ GITHUB_UA = "AIHub/1.0"
 GITHUB_FILE_LIMIT = 200 * 1024
 GITHUB_FILES = ("README.md", "README_zh.md", "README.rst", "readme.md",
                 "pyproject.toml", "setup.py", "requirements.txt", "package.json",
-                "Dockerfile", "Makefile", "install.sh",
-                ".python-version", ".nvmrc", ".node-version")
+                "Pipfile", "Pipfile.lock", "poetry.lock",
+                "Dockerfile", "Makefile", "install.sh", "runtime.txt",
+                ".python-version", ".tool-versions", ".nvmrc", ".node-version")
 _GH_TOKEN = {"loaded": False, "value": ""}
 _GH_JOBS = {}
 _GH_JOBS_LOCK = threading.Lock()
@@ -3077,6 +3095,18 @@ def pick_python(spec):
     return cands[0] if cands else None
 
 
+def _next_lower_python(pyver, py):
+    """版本不兼容时，找一个比当前版本低的最高可用版本（cands 已按版本降序）。"""
+    cur = _ver_tuple(pyver)
+    if not cur:
+        return None
+    for c in python_candidates():  # 降序：3.15, 3.12, 3.11 ...
+        cv = _ver_tuple(c["version"])
+        if cv and cv < cur:
+            return c
+    return None
+
+
 def _primary_name(candidates, *preferred):
     """优先选与包名/仓库名一致的入口，避免像 copaw 这种别名抢在前面。"""
     names = sorted(candidates or [])
@@ -3107,9 +3137,58 @@ def build_github_plan(parsed, meta, files, ref):
         scripts = _pyproject_scripts(pyproject)
     if not py_spec:
         py_spec = (files.get(".python-version") or "").strip()
+    # 其他常见 Python 版本声明源（按优先级）
+    if not py_spec:
+        # asdf / rtx 的 .tool-versions，取 python 行
+        m = re.search(r"(?m)^\s*python\s+(\d+(?:\.\d+){0,2})", files.get(".tool-versions") or "")
+        if m:
+            py_spec = m.group(1).strip()
+    if not py_spec:
+        # Pipfile 的 [requires] python_version
+        m = re.search(r"(?mi)^\s*python_version\s*=\s*[\"'](\d+(?:\.\d+){0,2})", files.get("Pipfile") or "")
+        if m:
+            py_spec = m.group(1).strip()
+    if not py_spec:
+        # poetry / pdm 在 pyproject 里可能有 [tool.poetry.dependencies] python = ...
+        m = re.search(r'(?mi)^\s*python\s*=\s*["\']([^"\']+)["\']', pyproject)
+        if m:
+            py_spec = m.group(1).strip()
+    if not py_spec:
+        # runtime.txt（Heroku 风格 python-3.11.2）
+        m = re.search(r"(?i)^python-(\d+(?:\.\d+){0,2})", (files.get("runtime.txt") or "").strip())
+        if m:
+            py_spec = m.group(1).strip()
+    setup_py = files.get("setup.py") or ""
+    classifiers_cap = ""
+    if not py_spec and setup_py:
+        m = re.search(r'python_requires\s*=\s*["\']([^"\']+)', setup_py)
+        if m:
+            py_spec = m.group(1).strip()
+    if setup_py:
+        caps = re.findall(r"Programming Language :: Python :: (\d+\.\d+)", setup_py)
+        if caps:
+            def _cv(s):
+                return tuple(int(x) for x in s.split("."))
+            classifiers_cap = max(caps, key=_cv)
+    # setup.py 的 classifiers 是作者实测兼容上限：收紧 spec，避免选中过新的解释器
+    if classifiers_cap:
+        # classifiers 上限是 major.minor（如 3.11），应理解为 <下一个 minor（<3.12），
+        # 才能包含 3.11.x；若写成 <=3.11 会被补零成 <=3.11.0 而错误排除 3.11.12。
+        cap_parts = classifiers_cap.split(".")
+        upper = ("%s.%d" % (cap_parts[0], int(cap_parts[1]) + 1)) if len(cap_parts) >= 2 else classifiers_cap
+        cap_constraint = "<%s" % upper
+        if not py_spec:
+            py_spec = cap_constraint
+        elif cap_constraint not in py_spec:
+            py_spec = "%s,%s" % (py_spec, cap_constraint)
+    # Dockerfile 的 FROM python:X 作为最后兜底
+    if not py_spec:
+        m = re.search(r"(?mi)^\s*FROM\s+python:(\d+(?:\.\d+)*)", files.get("Dockerfile") or "")
+        if m:
+            py_spec = m.group(1).strip()
 
     bins, node_scripts, pm = _pkg_json(pkg_text)
-    is_py = bool(pyproject or req_text or files.get("setup.py"))
+    is_py = bool(pyproject or req_text or files.get("setup.py") or files.get("Pipfile"))
     is_node = bool(pkg_text)
     entry_name = (_primary_name(scripts, py_name, parsed["repo"]) if scripts
                   else _primary_name(bins, parsed["repo"]))
@@ -3153,6 +3232,50 @@ def build_github_plan(parsed, meta, files, ref):
                      else "%s run %s" % (node_manager, key))
     if not start and entry:
         start = entry
+
+    # Python 项目兜底：从 Dockerfile CMD、Makefile、常见入口推断启动命令
+    if not start and is_py:
+        dockerfile = files.get("Dockerfile") or ""
+        # 兼容 shell 形式 CMD python -m mod 与 JSON 数组形式 CMD ["python","-m","mod"]
+        m = re.search(r"(?mi)^\s*(?:CMD|ENTRYPOINT)\s+(.+)$", dockerfile)
+        if m:
+            cmdline = m.group(1)
+            if "[" in cmdline:
+                # JSON 数组：提取引号内的 token
+                toks = re.findall(r'["\']([^"\']+)["\']', cmdline)
+            else:
+                toks = cmdline.split()
+            if toks:
+                pi = next((i for i, t in enumerate(toks) if re.match(r"^python3?$", t.strip())), -1)
+                if pi >= 0:
+                    after = [t.strip() for t in toks[pi + 1:] if t.strip()]
+                    if after:
+                        if after[0] in ("-m",):
+                            mod = after[1] if len(after) > 1 else ""
+                            if mod:
+                                start = "%s/python -m %s" % (venv_bin, mod)
+                        else:
+                            start = "%s/python %s" % (venv_bin, after[0])
+        if not start:
+            makefile = files.get("Makefile") or ""
+            m = re.search(r"(?m)^(?:start|run|up):\s*\n\s+(.+python[^\n]*)", makefile)
+            if m:
+                start = m.group(1).strip()
+        if not start:
+            # 通用入口推导：常见入口文件 + 从仓库名推导的包目录 __main__.py
+            repo_leaf = re.split(r"[-_]", parsed["repo"].split("/")[-1].lower())[0]
+            candidates = ("main.py", "app.py", "bot.py", "run.py", "server.py")
+            pkg_main = [
+                rel for rel in files
+                if rel.endswith("/__main__.py") and repo_leaf and repo_leaf in os.path.basename(os.path.dirname(rel)).lower()
+            ]
+            for rel in list(candidates) + pkg_main + [r for r in files if r.endswith("/__main__.py")]:
+                if rel in files:
+                    start = "%s/python %s" % (venv_bin, rel)
+                    break
+        if start and not start.startswith(venv_bin) and "python" in start.lower():
+            # Makefile 里的命令可能用全局 python，改用 venv
+            start = re.sub(r"\bpython3?\b", "%s/python" % venv_bin, start, count=1)
 
     port = None
     m = re.search(r"(?:127\.0\.0\.1|localhost):(\d{2,5})", readme)
@@ -3337,6 +3460,38 @@ def _clone_matches(target, url):
     return bool(head)
 
 
+def _relax_failed_pin(target, err_text):
+    """把 requirements.txt 中已下架的精确版本（from versions: none）改为不锁定版本。
+
+    返回被放宽的包名；若不是"版本不存在"类错误则不做修改。
+    只放宽明确报错的那一行，保留其余 pin，降低引入不兼容新版本的风险。
+    """
+    m = re.search(r"No matching distribution found for\s+([\w.-]+)\s*==\s*([\w.]+)", err_text or "", re.I)
+    if not m or not re.search(r"from versions:\s*none", err_text, re.I):
+        return ""
+    pkg = m.group(1)
+    req = os.path.join(target, "requirements.txt")
+    if not os.path.exists(req):
+        return ""
+    try:
+        lines = read_text(req).splitlines(True)
+        out, changed = [], False
+        for line in lines:
+            if re.match(r"^\s*%s\s*==" % re.escape(pkg), line, re.I):
+                newline = re.sub(r"(==)\s*[\w.]+", "", line, count=1)
+                if newline != line:
+                    changed = True
+            else:
+                newline = line
+            out.append(newline)
+        if changed:
+            open(req, "w").write("".join(out))
+            return pkg
+    except Exception:
+        pass
+    return ""
+
+
 def _run_github_import(job, parsed, target):
     try:
         job["step"] = "读取仓库信息"
@@ -3374,25 +3529,59 @@ def _run_github_import(job, parsed, target):
         venv_dir = os.path.join(target, ".venv")
         runtime = {"venv": "", "python": "", "pythonVersion": "",
                    "node": shutil.which("node", path=ENV.get("PATH")) or ""}
-        if plan.get("setup"):
+        pick = (plan.get("python") or {}).get("pick") or {}
+        env = None
+        retry_state = {"lower_py": False, "relaxed_pin": False}
+
+        def make_venv_and_setup(py, pyver, rebuild=False):
+            """建 venv + 跑 setup；失败时按策略自愈重试（降级 Python / 放宽失效 pin）。"""
+            nonlocal env, runtime
             job["step"] = "创建虚拟环境"
-            pick = (plan.get("python") or {}).get("pick") or {}
-            py = pick.get("path") or shutil.which("python3", path=ENV.get("PATH"))
-            if not py:
-                raise RuntimeError("本机没有可用的 Python 解释器")
-            _job_log(job, "解释器：" + py + ("（%s）" % pick.get("version") if pick.get("version") else ""))
+            if rebuild:
+                import shutil as _sh
+                _sh.rmtree(venv_dir, ignore_errors=True)
+            _job_log(job, "解释器：" + py + ("（%s）" % pyver if pyver else ""))
             code = _run_step(job, [py, "-m", "venv", venv_dir], target, timeout=300)
             if code != 0:
                 raise RuntimeError("创建虚拟环境失败（退出码 %s）" % code)
             runtime.update({"venv": venv_dir,
                             "python": os.path.join(venv_dir, "bin", "python"),
-                            "pythonVersion": pick.get("version") or ""})
-        env = project_process_env({"runtime": runtime})
-        for cmd in plan.get("setup") or []:
-            job["step"] = "安装依赖"
-            code = _run_step(job, ["/bin/zsh"] + shell_args() + [cmd], target, env)
-            if code != 0:
-                raise RuntimeError("依赖安装失败（退出码 %s）：%s" % (code, cmd))
+                            "pythonVersion": pyver or ""})
+            env = project_process_env({"runtime": runtime})
+            for cmd in plan.get("setup") or []:
+                job["step"] = "安装依赖"
+                before = len(job.get("log") or [])
+                code = _run_step(job, ["/bin/zsh"] + shell_args() + [cmd], target, env)
+                if code == 0:
+                    continue
+                err_lines = [ln for ln in (job.get("log") or [])[before:]
+                             if re.search(r"(?i)error|no matching distribution|could not find", ln)]
+                key = err_lines[-1][:300] if err_lines else ""
+                # 策略一：包版本已从索引下架（from versions: none）→ 放宽该行 pin 后重试
+                relaxed = _relax_failed_pin(target, "\n".join(err_lines))
+                if relaxed and not retry_state["relaxed_pin"]:
+                    retry_state["relaxed_pin"] = True
+                    _job_log(job, "依赖 %s 的指定版本已下架，已改为安装可用版本后重试…" % relaxed)
+                    return make_venv_and_setup(py, pyver, rebuild=False)
+                # 策略二：版本不兼容 → 降一个 Python 版本重试
+                if re.search(r"(?i)no matching distribution|requires a different python|not a supported wheel", key or cmd):
+                    lower = _next_lower_python(pyver, py)
+                    if lower and not retry_state["lower_py"]:
+                        retry_state["lower_py"] = True
+                        _job_log(job, "检测到版本不兼容，自动降级到 Python %s 重试…" % lower["version"])
+                        return make_venv_and_setup(lower["path"], lower["version"], rebuild=True)
+                raise RuntimeError(
+                    "依赖安装失败（退出码 %s）：%s%s" %
+                    (code, cmd, ("\n关键错误：" + key) if key else ""))
+            return True
+
+        if plan.get("setup"):
+            py = pick.get("path") or shutil.which("python3", path=ENV.get("PATH"))
+            if not py:
+                raise RuntimeError("本机没有可用的 Python 解释器")
+            make_venv_and_setup(py, pick.get("version") or "")
+        else:
+            env = project_process_env({"runtime": runtime})
 
         for cmd in plan.get("init") or []:
             job["step"] = "首次初始化"
@@ -3732,7 +3921,9 @@ AI_PROMPT = """你是本地开发项目的启动配置识别助手。根据下�
 要求：
 1. 只依据证据，不要编造文件；命令必须是能在对应目录直接执行的单行命令。
 2. 支持 monorepo / 多服务：如果项目里包含多个可独立启动的服务（例如 api、frontend），services 中分别列出，不要只给一个。
-3. 优先给出本地命令（npm/pnpm/yarn/mvn/go/cargo/python 等）。若证据里有版本声明（.nvmrc、java.version、go.mod 的 go 指令、rust-toolchain 等），命令应搭配对应的版本切换方式：Node 用 fnm exec --using=<版本> -- <命令>；Java 优先 ./mvnw 或 ./gradlew（其次 jenv/sdkman 切换到声明的 JDK）；有 rust-toolchain 时直接 cargo run 即可；Go 直接 go run 即可。若证据里的「本机可用版本」不满足要求且无版本管理工具，可在 start 里先写准备步骤（用 && 连接），例如先 source 版本管理器初始化脚本再执行命令。只有证据表明必须依赖 Docker 时才用 docker compose；存在本地启动方式时不要用 Docker。
+3. 优先给出本地命令（npm/pnpm/yarn/mvn/go/cargo/python 等）。若证据里有版本声明（.nvmrc、java.version、go.mod 的 go 指令、rust-toolchain、requires-python 等），命令应搭配对应的版本切换方式：Node 用 fnm exec --using=<版本> -- <命令>；Java 优先 ./mvnw 或 ./gradlew（其次 jenv/sdkman 切换到声明的 JDK）；有 rust-toolchain 时直接 cargo run 即可；Go 直接 go run 即可。若证据里的「本机可用版本」不满足要求且无版本管理工具，可在 start 里先写准备步骤（用 && 连接），例如先 source 版本管理器初始化脚本再执行命令。
+   3a. Python 项目：优先用项目虚拟环境的解释器（`{venv}/bin/python`，证据里 runtime.venv 会给出路径），不要写全局 `python3`；若项目声明了 requires-python / python_requires / .python-version 且本机版本不匹配，优先用 pyenv 切换（如 `pyenv local 3.11` 或 `pyenv exec python ...`）。若证据显示依赖尚未安装，可在 start 里加前置安装步骤用 && 连接。遇到依赖版本下架（No matching distribution），不要猜新命令，交给导入流程处理。
+   3b. 只有证据表明必须依赖 Docker 时才用 docker compose；存在本地启动方式时不要用 Docker。
 4. 忽略没有端口的工具进程（如 stdio 型 MCP），除非它确实监听端口。
 5. 每个服务的 path 使用绝对路径（都在给定项目目录内），start 在该 path 下执行。
 6. 若入口脚本依赖环境变量（如 DATA_DIR），而仓库内有对应目录，请把必要变量写进启动命令，例如 `DATA_DIR=../data npm start`。
@@ -4003,6 +4194,11 @@ def project_evidence(path):
             parts.append("本机可用版本: " + json.dumps(available, ensure_ascii=False))
         if mgrs:
             parts.append("本机版本管理工具: " + ", ".join(mgrs))
+        # 已有虚拟环境：告诉 AI 用 venv 解释器（而非全局 python3）
+        for vrel in (".venv/bin/python", "venv/bin/python", ".env/bin/python"):
+            if os.path.isfile(os.path.join(path, vrel)):
+                parts.append("项目虚拟环境: " + os.path.join(path, vrel))
+                break
     except Exception:
         pass
 
