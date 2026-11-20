@@ -27,10 +27,11 @@ venv/
 # ---- 本地临时文件 ----
 *.local.json
 
-# ---- 产物不进代码仓库 ----
-# 规范：设计稿/截图/报告统一放仓库外的 ~/code/aihub-artifacts/，最终归宿是 ima「项目文档/aihub」
-# 以下为兼容旧路径（产物已外迁，防止误提交）
+# ---- 产物不进版本控制（物理放在项目内，靠 gitignore 挡住）----
+# 规范：设计稿/截图/报告统一放项目内 _artifacts/{design,screenshots,reports}/
+# 最终归宿是 ima「项目文档/aihub」，见 ~/.codebuddy/rules/artifacts-location.md
 _artifacts/
+# 兼容旧路径（防止误提交）
 /design/
 /docs/screenshots/
 /AIHUB-*.md
