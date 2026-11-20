@@ -6009,7 +6009,9 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
     .card-actions .more .btn{ padding:8px 9px; }
   }
 
-  /* == MINIMAL-TOPNAV v1 == */
+
+
+  /* == MINIMAL-TOPNAV v2 == */
   /* 极简灰阶（Tailwind Zinc）：保留原变量名，仅覆盖色值，确保组件样式自动继承 */
   :root{
     --bg:#FAFAFA; --panel:#FFFFFF; --surface:#F4F4F5;
@@ -6073,6 +6075,9 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
   .card:hover{ box-shadow:none; }
   .btn:hover{ transform:none; }
   .btn.primary{ background:var(--text); border-color:var(--text); color:var(--panel); }
+  /* v2 新增：卡片网格改为自适应列宽——卡片少时自动变宽铺满，卡片多时自然分列 */
+  .group-grid{ grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch; }
+  .group-grid > .card{ width:100%; min-width:0; }
   /* 窄屏：顶栏自然换行，不做图标栏收缩 */
   @media (max-width:900px){
     .rail{ width:100% !important; flex-basis:auto !important; padding:9px 14px; }
@@ -6081,9 +6086,8 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
     .nav-btn{ justify-content:flex-start; padding:7px 12px; }
     .row{ justify-content:flex-start; padding:3px 10px; }
   }
-  /* == END MINIMAL-TOPNAV v1 == */
-
-</style>
+  /* == END MINIMAL-TOPNAV v2 == */
+  </style>
 </head>
 <body>
 <div class="app">
@@ -7915,7 +7919,9 @@ MODELS_PAGE = r"""<!DOCTYPE html>
     .nav-btn{ justify-content:center; padding:9px 0; }
   }
 
-  /* == MINIMAL-TOPNAV v1 == */
+
+
+  /* == MINIMAL-TOPNAV v2 == */
   /* 极简灰阶（Tailwind Zinc）：保留原变量名，仅覆盖色值，确保组件样式自动继承 */
   :root{
     --bg:#FAFAFA; --panel:#FFFFFF; --surface:#F4F4F5;
@@ -7979,6 +7985,9 @@ MODELS_PAGE = r"""<!DOCTYPE html>
   .card:hover{ box-shadow:none; }
   .btn:hover{ transform:none; }
   .btn.primary{ background:var(--text); border-color:var(--text); color:var(--panel); }
+  /* v2 新增：卡片网格改为自适应列宽——卡片少时自动变宽铺满，卡片多时自然分列 */
+  .group-grid{ grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch; }
+  .group-grid > .card{ width:100%; min-width:0; }
   /* 窄屏：顶栏自然换行，不做图标栏收缩 */
   @media (max-width:900px){
     .rail{ width:100% !important; flex-basis:auto !important; padding:9px 14px; }
@@ -7987,9 +7996,8 @@ MODELS_PAGE = r"""<!DOCTYPE html>
     .nav-btn{ justify-content:flex-start; padding:7px 12px; }
     .row{ justify-content:flex-start; padding:3px 10px; }
   }
-  /* == END MINIMAL-TOPNAV v1 == */
-
-</style>
+  /* == END MINIMAL-TOPNAV v2 == */
+  </style>
 </head>
 <body>
 <div class="app">
@@ -8742,7 +8750,9 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
     .row{ flex-wrap:wrap; }
   }
 
-  /* == MINIMAL-TOPNAV v1 == */
+
+
+  /* == MINIMAL-TOPNAV v2 == */
   /* 极简灰阶（Tailwind Zinc）：保留原变量名，仅覆盖色值，确保组件样式自动继承 */
   :root{
     --bg:#FAFAFA; --panel:#FFFFFF; --surface:#F4F4F5;
@@ -8806,6 +8816,9 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
   .card:hover{ box-shadow:none; }
   .btn:hover{ transform:none; }
   .btn.primary{ background:var(--text); border-color:var(--text); color:var(--panel); }
+  /* v2 新增：卡片网格改为自适应列宽——卡片少时自动变宽铺满，卡片多时自然分列 */
+  .group-grid{ grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch; }
+  .group-grid > .card{ width:100%; min-width:0; }
   /* 窄屏：顶栏自然换行，不做图标栏收缩 */
   @media (max-width:900px){
     .rail{ width:100% !important; flex-basis:auto !important; padding:9px 14px; }
@@ -8814,9 +8827,8 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
     .nav-btn{ justify-content:flex-start; padding:7px 12px; }
     .row{ justify-content:flex-start; padding:3px 10px; }
   }
-  /* == END MINIMAL-TOPNAV v1 == */
-
-</style>
+  /* == END MINIMAL-TOPNAV v2 == */
+  </style>
 </head>
 <body>
 <div class="app">
