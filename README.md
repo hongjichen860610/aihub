@@ -7,13 +7,14 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)]()
 
-`aihub.py` 是单文件 Python 程序，只用标准库，没有 `requirements.txt`，也没有构建步骤。运行后在本机 `http://127.0.0.1:8799` 打开三个页面：
+`aihub.py` 是单文件 Python 程序，只用标准库，没有 `requirements.txt`，也没有构建步骤。运行后在本机 `http://127.0.0.1:8799` 打开四个页面：
 
 | 页面 | 解决什么问题 |
 | --- | --- |
 | **项目** | 几十个本地项目，不知道该用哪条命令启动、端口被谁占了 |
 | **模型** | 多个平台的 API Key 散落在各处，模型能力、余额、可用性心里没数 |
 | **工具** | Ollama / Claude Code / OpenClaw 装没装、能不能用、该用哪个模型 |
+| **资产**（`/assets`，`⌘4`） | 盘点本机全部可识别资产的磁盘占用、分类、来源与运行状态，支持筛选、标记、证据链、可回收建议、快照对比与导出 |
 
 ## 截图
 
@@ -51,6 +52,18 @@
 - 兼容账号可直接用于对话，无需重复配置
 - 支持自定义 CLI 工具，用 `{prompt}` 占位符接入任意命令行 AI
 
+### 资产
+- 只读扫描：项目、CLI、运行时、多版本 Python/JDK、依赖目录、模型缓存、容器、后台服务
+- 数据来源包括 aihub 现有记录、Homebrew、pyenv / uv / rustup、npm / pipx 与已知工具目录；非 AI 资产同样收录
+- 总占用、分类占比、占用 Top 10、最近新增；表格 / 目录树两种视图，支持按类别、来源、AI 标签、状态、收录状态筛选
+- 「AI 相关」只是标签和快捷视图，不是准入条件；未知来源也照常展示
+- 忽略、标签、备注保存在本机配置，优先级高于自动推断
+- 来源证据链：每条资产显示发现来源、判定依据、置信度（高/中/低/未知）与脱敏后的证据；AI 相关区分「是/未知/否」，标签基于推断不等于事实
+- 快照与差异对比：可保存最多 20 份快照，对比任意两份快照或「快照 → 当前清单」，按资产路径识别新增 / 消失 / 变大 / 变小 / 属性变化，展示字段级变更明细；大小变化小于 1KB 视为噪声
+- 导出：可把当前筛选结果或全部清单导出为 CSV / JSON；证据链已脱敏，导出全程在本机浏览器完成，不联网
+- 可回收建议：每条资产标注「可回收 / 谨慎回收 / 不建议回收 / 待确认」及原因，汇总可回收大小；「可回收」快捷视图只看有回收空间的项。**当前版本只给建议，不删除任何文件**，实际清理留待 P2
+- 默认只扫 `~/code`、`~/Projects`、`~/workspace`；个人目录需在配置里显式填写，扫描过程不修改任何文件
+
 ## 快速开始
 
 要求：macOS，Python 3.9+，无需安装任何第三方包。
@@ -81,6 +94,9 @@ cp models.example.json models.json       # 可选：预置模型账号（密钥�
 | `models.json` | 模型账号、模型清单、能力标签 | 否（含平台与账号信息） |
 | `envs.json` | 每个项目的 Node 版本偏好 | 否 |
 | `ai_tools.json` | 自定义 CLI 工具 | 否 |
+| `assets.json` | 资产页的扫描根目录、排除规则、忽略/标签/备注 | 否（含本机路径） |
+| `assets.index.json` | 最近一次资产扫描结果缓存 | 否（自动生成） |
+| `assets.snapshots/` | 资产快照（最多 20 份），用于差异对比 | 否（自动生成） |
 | `logs/`、`uploads/` | 项目日志、对话上传的图片 | 否 |
 
 `.gitignore` 已默认排除以上全部内容。
@@ -140,6 +156,6 @@ curl -H 'X-AIHub: 1' -H 'Content-Type: application/json' \
 python3 aihub.py   # requires Python 3.9+ on macOS, no pip install
 ```
 
-Data files (`projects.json`, `models.json`, `envs.json`, `ai_tools.json`, `logs/`, `uploads/`) are local-only and git-ignored. See [*.example.json](models.example.json) for their shape.
+Data files (`projects.json`, `models.json`, `envs.json`, `ai_tools.json`, `assets.json`, `assets.index.json`, `assets.snapshots/`, `logs/`, `uploads/`) are local-only and git-ignored. See [*.example.json](models.example.json) for their shape.
 
 macOS is the only supported platform today; Linux and Windows support, an MCP mode, and a CLI are on the roadmap. MIT licensed.

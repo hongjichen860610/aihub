@@ -6,6 +6,9 @@ envs.json
 ai_tools.json
 custom_tools.json
 clis.json
+assets.json
+assets.index.json
+assets.snapshots/
 .cli-backups/
 logs/
 uploads/

@@ -8,10 +8,12 @@
 
 import base64
 import binascii
+import fnmatch
 import json
 import os
 import re
 import shlex
+import stat
 import shutil
 import signal
 import socket
@@ -51,7 +53,11 @@ CLI_BACKUP_DIR = os.path.join(BASE_DIR, ".cli-backups")
 KEYCHAIN_ACCOUNT = "aihub"
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-DEFAULT_SCAN_ROOTS = ["~/Documents", "~/Projects", "~/code", "~/Desktop", "~/Downloads", "~/workspace"]
+ASSETS_FILE = os.path.join(BASE_DIR, "assets.json")
+ASSETS_INDEX_FILE = os.path.join(BASE_DIR, "assets.index.json")
+ASSETS_SNAPSHOT_DIR = os.path.join(BASE_DIR, "assets.snapshots")
+# 默认只扫开发目录；~/Documents、~/Desktop、~/Downloads 等个人目录需用户在扫描弹窗里显式填写
+DEFAULT_SCAN_ROOTS = ["~/code", "~/Projects", "~/workspace"]
 
 # 保证能调用 brew / claude / openclaw
 ENV = dict(os.environ)
@@ -5367,6 +5373,995 @@ def project_context_block(p):
 
 # ---------------- HTTP ----------------
 
+# ---------------- 本机资产清单（只读扫描） ----------------
+
+ASSET_CATEGORY_LABELS = {
+    "project": "项目", "cli": "CLI 工具", "runtime": "运行时", "dependency": "依赖",
+    "model": "模型缓存", "container": "容器", "service": "后台服务", "other": "其他",
+}
+AI_KEYWORDS = (
+    "workbuddy", "codebuddy", "claude", "ollama", "openclaw", "huggingface",
+    "modelscope", "lm studio", "aihub", "ailearning", "cursor", "aider",
+    "langchain", "embedding", "chatgpt", "openai", "gemini",
+)
+DEFAULT_ASSET_EXCLUDES = ["*/__pycache__/*", "*/.git/*", "*.log"]
+
+
+def load_assets_config():
+    cfg = load_json_file(ASSETS_FILE, {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    roots = cfg.get("roots") or list(DEFAULT_SCAN_ROOTS)
+    if isinstance(roots, str):
+        roots = roots.splitlines()
+    roots = [normalize_path(r) for r in roots if str(r).strip()]
+    cfg["roots"] = [r for r in roots if r] or list(DEFAULT_SCAN_ROOTS)
+    excl = cfg.get("exclude") or list(DEFAULT_ASSET_EXCLUDES)
+    if isinstance(excl, str):
+        excl = excl.splitlines()
+    cfg["exclude"] = [str(x).strip() for x in excl if str(x).strip()]
+    if not isinstance(cfg.get("ignored"), dict):
+        cfg["ignored"] = {}
+    if not isinstance(cfg.get("tags"), dict):
+        cfg["tags"] = {}
+    if not isinstance(cfg.get("notes"), dict):
+        cfg["notes"] = {}
+    return cfg
+
+
+def save_assets_config(cfg):
+    write_json_file(ASSETS_FILE, cfg)
+
+
+def _asset_excluded(path, cfg):
+    p = normalize_path(path)
+    if not p:
+        return False
+    for pat in cfg.get("exclude") or []:
+        if fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(os.path.basename(p), pat):
+            return True
+    return False
+
+
+def _fmt_asset_time(ts):
+    if not ts:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except Exception:
+        return ""
+
+
+def _path_stats(path, max_files=20000, max_seconds=10):
+    """只读统计目录/文件大小；硬链接按 inode 去重，符号链接不跟随，超时标记 truncated。"""
+    out = {"size": 0, "files": 0, "created": 0, "modified": 0, "truncated": False}
+    path = normalize_path(path)
+    if not path:
+        return out
+    if os.path.isfile(path):
+        try:
+            st = os.stat(path)
+            out["size"] = int(st.st_size)
+            out["files"] = 1
+            out["modified"] = st.st_mtime
+            out["created"] = getattr(st, "st_birthtime", 0) or st.st_mtime
+        except OSError:
+            pass
+        return out
+    if not os.path.isdir(path):
+        return out
+    started = time.time()
+    seen = set()
+    stack = [path]
+    while stack:
+        if time.time() - started > max_seconds or out["files"] >= max_files:
+            out["truncated"] = True
+            break
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as entries:
+                for ent in entries:
+                    try:
+                        st = ent.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(ent.path)
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    key = (st.st_dev, st.st_ino)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out["size"] += int(st.st_size)
+                    out["files"] += 1
+                    if st.st_mtime > out["modified"]:
+                        out["modified"] = st.st_mtime
+                    birth = getattr(st, "st_birthtime", 0)
+                    if birth and (not out["created"] or birth < out["created"]):
+                        out["created"] = birth
+                    if out["files"] >= max_files:
+                        out["truncated"] = True
+                        break
+        except OSError:
+            pass
+    if not out["created"] and out["modified"]:
+        out["created"] = out["modified"]
+    return out
+
+
+# ---- 来源证据链与脱敏（FR-13）----
+
+CONFIDENCE_LABELS = {"high": "高", "medium": "中", "low": "低", "unknown": "未知"}
+CONFIDENCE_REASONS = {
+    "high": "来自 aihub 自身记录或明确的 AI 工具数据源，安装来源明确",
+    "medium": "来自包管理器或版本管理工具的安装记录，安装途径明确",
+    "low": "由目录扫描或端口探测发现，只能定位路径，无法确认安装者",
+    "unknown": "缺少可用的来源线索，不做推断",
+}
+_CONFIDENCE_SOURCES = {
+    "high": {"aihub 项目", "aihub 工具", "aihub", "Ollama", "WorkBuddy", "CodeBuddy",
+             "WorkBuddy 内置"},
+    "medium": {"Homebrew", "Homebrew Cask", "npm 全局", "npm npx", "npm", "pipx", "pyenv",
+               "uv", "rustup", "SDKMAN", "版本管理工具", "本机运行时", "Maven", "Gradle",
+               "corepack", "Hugging Face", "ModelScope", "LM Studio"},
+    "low": {"目录扫描", "launchd", "Docker", "OrbStack", "Colima", "Ollama 模型"},
+}
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(token|secret|password|passwd|api[_-]?key|apikey|authorization|credential|"
+    r"access[_-]?key|private[_-]?key)(\s*[:=]\s*)([\"']?)([^\s,;\"'}]+)")
+TOKEN_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b")
+HOME_PATH_RE = re.compile(r"/(?:Users|home)/[^/\s]+/")
+
+
+def redact_text(value, limit=500):
+    """展示与导出前脱敏：密钥赋值、常见 token 格式、私有路径的用户名片段。"""
+    s = str(value or "")
+    if not s:
+        return ""
+    s = SENSITIVE_ASSIGNMENT_RE.sub(lambda m: m.group(1) + m.group(2) + m.group(3) + "***", s)
+    s = TOKEN_RE.sub("***", s)
+    s = HOME_PATH_RE.sub("~/", s)
+    return s[:limit]
+
+
+def source_confidence(source="", evidence="", path=""):
+    src = str(source or "")
+    for level in ("high", "medium", "low"):
+        if src in _CONFIDENCE_SOURCES[level]:
+            return level
+    if src or evidence or path:
+        return "low"
+    return "unknown"
+
+
+def build_evidence_items(source="", evidence="", path="", rec=None):
+    items = []
+    if source:
+        items.append({"label": "发现来源", "value": redact_text(source, 160)})
+    if evidence:
+        items.append({"label": "判定依据", "value": redact_text(evidence, 240)})
+    if path:
+        items.append({"label": "路径线索", "value": redact_text(path, 240)})
+    rec = rec or {}
+    if rec.get("in_aihub"):
+        link = " / ".join([x for x in (rec.get("aihub_page"), rec.get("entity_id")) if x])
+        if link:
+            items.append({"label": "aihub 关联", "value": redact_text(link, 160)})
+    conf = rec.get("confidence") or source_confidence(source, evidence, path)
+    items.append({"label": "置信度说明", "value": CONFIDENCE_REASONS.get(
+        conf, CONFIDENCE_REASONS["unknown"])})
+    return items
+
+
+def ensure_evidence(rec):
+    """给旧索引/旧快照记录补齐证据链字段，避免升级后详情为空。"""
+    if not isinstance(rec, dict):
+        return rec
+    conf = rec.get("confidence")
+    if conf not in CONFIDENCE_LABELS:
+        conf = source_confidence(rec.get("source"), rec.get("evidence"), rec.get("path"))
+        rec["confidence"] = conf
+    rec["confidence_label"] = CONFIDENCE_LABELS[conf]
+    if not isinstance(rec.get("evidence_items"), list) or not rec.get("evidence_items"):
+        rec["evidence_items"] = build_evidence_items(
+            rec.get("source"), rec.get("evidence"), rec.get("path"), rec)
+    if rec.get("ai_state") not in ("yes", "no", "unknown"):
+        rec["ai_state"] = "yes" if rec.get("ai_related") else "no"
+    return ensure_reclaim(rec)
+
+
+# ---- 可回收建议（P1：只给建议，不执行清理）----
+
+RECLAIM_LEVELS = {
+    "safe": "可回收", "caution": "谨慎回收", "keep": "不建议回收", "unknown": "待确认",
+}
+_RECLAIM_SAFE_HINTS = ("_cacache", "_npx", "npx 缓存", ".gradle/caches", "corepack")
+_RECLAIM_CAUTION_HINTS = (
+    "node_modules", "/.venv", "/venv", "/target", "/build", "/dist", "/.gradle",
+    "/.m2/repository",
+)
+_RECLAIM_KEEP_SOURCES = {
+    "WorkBuddy", "WorkBuddy 内置", "CodeBuddy", "Claude", "aihub", "aihub 项目",
+    "aihub 工具", "Ollama", "Homebrew", "Homebrew Cask", "npm 全局", "pipx",
+    "pyenv", "uv", "rustup", "SDKMAN", "本机运行时", "版本管理工具",
+}
+_RECLAIM_MODEL_SOURCES = {"Ollama", "Hugging Face", "ModelScope", "LM Studio"}
+
+
+def _reclaim_rule(rec):
+    """按来源、类别、路径推断回收建议；只读，不产生任何清理动作。"""
+    name = str(rec.get("name") or "").lower()
+    path = str(rec.get("path") or "").lower()
+    category = str(rec.get("category") or "other")
+    source = str(rec.get("source") or "")
+    status = str(rec.get("status") or "")
+    text = name + " " + path
+    if status == "running":
+        return "keep", "正在运行，回收可能影响当前服务（P2 也会禁止清理）", "high"
+    if rec.get("in_aihub") and category != "dependency":
+        return "keep", "aihub 已登记，建议到对应页面管理，不要直接删除目录", "high"
+    if source in ("WorkBuddy 内置", "WorkBuddy", "CodeBuddy", "Claude", "aihub", "aihub 项目"):
+        return "keep", "AI 工具运行时或数据目录，删除可能导致工具无法启动", "high"
+    if any(h in text for h in _RECLAIM_SAFE_HINTS):
+        return "safe", "包管理器缓存，删除后会在下次使用时自动重建", "low"
+    if category == "model" or source in _RECLAIM_MODEL_SOURCES:
+        return "caution", "模型文件重新下载成本高，确认不再使用后再回收", "medium"
+    if any(h in text for h in _RECLAIM_CAUTION_HINTS):
+        if "/.m2/repository" in text:
+            return "caution", "Maven 本地仓库可能含私有构件，删除后不一定能重新下载", "medium"
+        return "caution", "项目依赖产物，删除后需重新安装或重新构建", "medium"
+    if category == "dependency":
+        return "caution", "依赖目录，确认项目不再需要后再回收", "medium"
+    if source in _RECLAIM_KEEP_SOURCES:
+        return "keep", "通过包管理器或版本工具安装，建议用对应工具卸载", "high"
+    if category == "container":
+        return "keep", "容器运行时数据，请在容器工具内清理镜像与卷", "high"
+    if category == "service":
+        return "caution", "已停止的后台服务，回收前确认不再需要自启", "medium"
+    if status == "missing":
+        return "unknown", "配置引用已失效，但目录本身不存在，请先核实残留配置", "low"
+    if category == "project":
+        return "keep", "项目源码目录，需人工确认，不建议自动回收", "high"
+    return "unknown", "用途不明，仅扫描到路径，建议先人工确认", "low"
+
+
+def ensure_reclaim(rec):
+    """给新旧记录补齐回收建议字段；可回收大小按建议等级计算。"""
+    if not isinstance(rec, dict):
+        return rec
+    level = rec.get("reclaim_level")
+    if level not in RECLAIM_LEVELS:
+        level, reason, risk = _reclaim_rule(rec)
+        rec["reclaim_level"] = level
+        rec["reclaim_reason"] = reason
+        rec["reclaim_risk"] = risk
+    elif not rec.get("reclaim_reason") or not rec.get("reclaim_risk"):
+        _, reason, risk = _reclaim_rule(rec)
+        rec["reclaim_reason"] = rec.get("reclaim_reason") or reason
+        rec["reclaim_risk"] = rec.get("reclaim_risk") or risk
+    rec["reclaim_label"] = RECLAIM_LEVELS[level]
+    rec["reclaim"] = {
+        "level": level, "label": RECLAIM_LEVELS[level],
+        "reason": str(rec.get("reclaim_reason") or ""),
+        "risk": str(rec.get("reclaim_risk") or "low"),
+    }
+    rec["reclaimable_size"] = int(rec.get("size") or 0) if level in ("safe", "caution") else 0
+    return rec
+
+
+def _ai_flag(text):
+    low = str(text or "").lower()
+    for kw in AI_KEYWORDS:
+        if kw in low:
+            return True, kw
+    return False, ""
+
+
+def _apply_user_meta(rec, cfg):
+    rid = rec.get("id") or ""
+    ignored = cfg.get("ignored") or {}
+    rec["ignored"] = bool(ignored.get(rid))
+    tags = cfg.get("tags") or {}
+    value = tags.get(rid) or []
+    rec["tags"] = list(value) if isinstance(value, list) else [str(value)]
+    notes = cfg.get("notes") or {}
+    rec["note"] = str(notes.get(rid) or "")
+    return rec
+
+
+def _asset_record(path, name, category, source, cfg, evidence="", ai=None,
+                  size_path=None, virtual=False, **extra):
+    path = normalize_path(path)
+    if not path and not virtual:
+        return None
+    if path and _asset_excluded(path, cfg):
+        return None
+    real = os.path.realpath(path) if path else ""
+    rid = real or ("v-" + category + ":" + str(name or "unknown"))
+    st = _path_stats(size_path or path) if path else {
+        "size": 0, "files": 0, "created": 0, "modified": 0, "truncated": False}
+    if ai is None:
+        hit_name, kw_name = _ai_flag(str(name or ""))
+        hit_other, kw = _ai_flag(" ".join([path, source, evidence]))
+        kw = kw or kw_name
+        ai = bool(hit_name or hit_other)
+        ai_state = "yes" if hit_name else ("unknown" if hit_other else "no")
+    else:
+        kw = evidence or source
+        ai_state = "yes" if ai else "no"
+    rec = {
+        "id": rid,
+        "name": name or (os.path.basename(real.rstrip(os.sep)) if real else rid),
+        "category": category,
+        "path": path,
+        "real_path": real,
+        "size": st["size"],
+        "total_size": st["size"],
+        "file_count": st["files"],
+        "created_ts": st["created"],
+        "modified_ts": st["modified"],
+        "created": _fmt_asset_time(st["created"]),
+        "modified": _fmt_asset_time(st["modified"]),
+        "source": source,
+        "ai_related": bool(ai),
+        "ai_state": ai_state,
+        "confidence": source_confidence(source, evidence, path),
+        "confidence_label": "",
+        "evidence_items": [],
+        "evidence": evidence or kw,
+        "in_aihub": False,
+        "aihub_page": "",
+        "entity_id": "",
+        "status": "unknown",
+        "parent": "",
+        "risk": "low",
+        "truncated": st["truncated"],
+    }
+    rec.update(extra)
+    ensure_evidence(rec)
+    return _apply_user_meta(rec, cfg)
+
+
+def _cmd_text(args, timeout=8):
+    try:
+        code, out, err = run_cmd(args, timeout=timeout)
+        return out if code == 0 else ""
+    except Exception:
+        return ""
+
+
+def _iter_dirs(base):
+    result = []
+    try:
+        with os.scandir(base) as entries:
+            for ent in entries:
+                try:
+                    if ent.is_dir(follow_symlinks=False):
+                        result.append(ent.path)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return result
+
+
+def collect_assets(cfg=None):
+    """只读收集本机资产；任何单项失败都不影响其他项。"""
+    cfg = cfg or load_assets_config()
+    assets = []
+    seen = set()
+
+    def add(rec):
+        if rec and rec.get("id") and rec["id"] not in seen:
+            seen.add(rec["id"])
+            assets.append(rec)
+
+    # 1. aihub 已注册项目
+    registered = {}
+    for p in load_projects():
+        path = normalize_path(p.get("path"))
+        if not path:
+            continue
+        real = os.path.realpath(path)
+        registered[real] = p
+        add(_asset_record(path, p.get("name") or os.path.basename(path), "project",
+                          "aihub 项目", cfg, evidence="projects.json",
+                          status="missing" if not os.path.isdir(path) else "unknown",
+                          in_aihub=True, aihub_page="projects", entity_id=p.get("id", "")))
+
+    # 2. 配置根目录下发现的项目（复用项目扫描，不重复实现识别）
+    try:
+        found = scan_projects(cfg["roots"], depth=2, limit=120)
+    except Exception:
+        found = []
+    project_paths = []
+    for it in found:
+        path = normalize_path(it.get("path"))
+        if not path or os.path.realpath(path) in registered:
+            continue
+        project_paths.append(path)
+        add(_asset_record(path, it.get("name") or os.path.basename(path), "project",
+                          "目录扫描", cfg, evidence="发现于配置根目录", status="unknown"))
+    for p in load_projects():
+        path = normalize_path(p.get("path"))
+        if path and path not in project_paths:
+            project_paths.append(path)
+
+    # 3. 项目内依赖产物
+    for project_path in project_paths:
+        for sub in ("node_modules", ".venv", "venv", "target", "build", "dist", ".gradle"):
+            dep = os.path.join(project_path, sub)
+            if not os.path.isdir(dep):
+                continue
+            add(_asset_record(dep, os.path.basename(project_path) + " / " + sub,
+                              "dependency", "项目依赖", cfg, evidence="项目内依赖目录",
+                              parent=os.path.realpath(project_path), risk="medium"))
+
+    # 4. aihub 已识别工具
+    try:
+        tools = ai_tools_payload().get("tools") or []
+    except Exception:
+        tools = []
+    for t in tools:
+        if not t.get("available"):
+            continue
+        tid = str(t.get("id") or "")
+        detail = str(t.get("detail") or "")
+        exe = detail if os.path.exists(detail) else (shutil.which(tid) or "")
+        source = "aihub 工具"
+        if tid == "ollama":
+            source = "Ollama"
+        add(_asset_record(exe, t.get("label") or tid, "cli", source, cfg,
+                          evidence="工具页探测", ai=True,
+                          status="running" if t.get("kind") == "http" else "available",
+                          in_aihub=True, aihub_page="tools", entity_id=tid,
+                          virtual=not bool(exe)))
+
+    # 5. 运行时与版本管理
+    try:
+        env = env_tools_payload()
+    except Exception:
+        env = {"managers": [], "runtimes": []}
+    for m in env.get("managers") or []:
+        if not m.get("available"):
+            continue
+        detail = str(m.get("detail") or "")
+        exe = detail if os.path.exists(detail) else ""
+        add(_asset_record(exe, m.get("label") or m.get("id") or "", "cli",
+                          "版本管理工具", cfg, evidence="工具页探测",
+                          in_aihub=True, aihub_page="tools", entity_id=m.get("id", ""),
+                          virtual=not bool(exe)))
+    runtimes = {"node": "node", "java": "java", "go": "go", "rustc": "rustc",
+                "python3": "python3"}
+    for r in env.get("runtimes") or []:
+        version = str(r.get("version") or "").strip()
+        if not version:
+            continue
+        exe = shutil.which(runtimes.get(r.get("id"), ""), path=ENV.get("PATH")) or ""
+        add(_asset_record(exe, "%s %s" % (r.get("label") or r.get("id"), version),
+                          "runtime", "本机运行时", cfg, evidence="本机版本探测",
+                          in_aihub=True, aihub_page="tools", entity_id=r.get("id", ""),
+                          virtual=not bool(exe)))
+
+    # 6. Homebrew 安装记录
+    brew_prefix = _cmd_text(["brew", "--prefix"], 8)
+    if brew_prefix and os.path.isdir(brew_prefix):
+        for flag, sub, category, src in (
+                ("--formula", "Cellar", "cli", "Homebrew"),
+                ("--cask", "Caskroom", "other", "Homebrew Cask")):
+            names = _cmd_text(["brew", "list", flag, "-1"], 20)
+            for line in (names or "").splitlines():
+                name = line.strip()
+                if not name:
+                    continue
+                add(_asset_record(os.path.join(brew_prefix, sub, name), name,
+                                  category, src, cfg, evidence="brew list " + flag))
+
+    # 7. 版本管理器里的多版本
+    version_sources = (
+        (os.path.join(HOME, ".pyenv", "versions"), "Python", "runtime", "pyenv"),
+        (os.path.join(HOME, ".local", "share", "uv", "python"), "Python", "runtime", "uv"),
+        (os.path.join(HOME, ".workbuddy", "binaries", "python", "versions"),
+         "Python", "runtime", "WorkBuddy 内置"),
+        (os.path.join(HOME, ".rustup", "toolchains"), "Rust", "runtime", "rustup"),
+        (os.path.join(HOME, ".sdkman", "candidates", "java"), "JDK", "runtime", "SDKMAN"),
+    )
+    for base, label, category, source in version_sources:
+        for item in _iter_dirs(base):
+            add(_asset_record(item, "%s %s" % (label, os.path.basename(item)),
+                              category, source, cfg, evidence=base,
+                              risk="high" if source == "WorkBuddy 内置" else "low",
+                              ai=source == "WorkBuddy 内置"))
+
+    # 8. npm / pipx / npx 安装记录
+    npm_root = _cmd_text(["npm", "root", "-g"], 12)
+    if npm_root and os.path.isdir(npm_root):
+        for item in _iter_dirs(npm_root):
+            if os.path.basename(item).startswith("@"):
+                for pkg in _iter_dirs(item):
+                    add(_asset_record(pkg, os.path.basename(pkg), "cli", "npm 全局", cfg,
+                                      evidence="npm root -g"))
+            else:
+                add(_asset_record(item, os.path.basename(item), "cli", "npm 全局", cfg,
+                                  evidence="npm root -g"))
+    npx_root = os.path.join(HOME, ".npm", "_npx")
+    for item in _iter_dirs(npx_root):
+        add(_asset_record(item, "npx 缓存 " + os.path.basename(item), "dependency",
+                          "npm npx", cfg, evidence="~/.npm/_npx"))
+    pipx_root = os.path.join(HOME, ".local", "share", "pipx", "venvs")
+    for item in _iter_dirs(pipx_root):
+        add(_asset_record(item, os.path.basename(item), "cli", "pipx", cfg,
+                          evidence="pipx venv"))
+
+    # 9. 已知缓存 / 模型 / 工具数据目录
+    known_dirs = (
+        (os.path.join(HOME, ".m2", "repository"), "Maven 仓库", "dependency", "Maven", False, "low"),
+        (os.path.join(HOME, ".npm", "_cacache"), "npm 缓存", "dependency", "npm", False, "low"),
+        (os.path.join(HOME, ".gradle", "caches"), "Gradle 缓存", "dependency", "Gradle", False, "low"),
+        (os.path.join(HOME, ".cache", "node", "corepack"), "corepack 缓存", "dependency", "corepack", False, "low"),
+        (os.path.join(HOME, ".ollama", "models"), "Ollama 模型", "model", "Ollama", True, "medium"),
+        (os.path.join(HOME, ".cache", "huggingface"), "Hugging Face 缓存", "model", "Hugging Face", True, "medium"),
+        (os.path.join(HOME, ".cache", "modelscope"), "ModelScope 缓存", "model", "ModelScope", True, "medium"),
+        (os.path.join(HOME, ".cache", "lm-studio"), "LM Studio 缓存", "model", "LM Studio", True, "medium"),
+        (os.path.join(HOME, ".workbuddy"), "WorkBuddy 数据", "other", "WorkBuddy", True, "high"),
+        (os.path.join(HOME, ".codebuddy"), "CodeBuddy 数据", "other", "CodeBuddy", True, "high"),
+        (os.path.join(HOME, ".claude"), "Claude 数据", "other", "Claude", True, "high"),
+        (os.path.join(BASE_DIR, ".cli-backups"), "aihub CLI 备份", "other", "aihub", True, "high"),
+        (os.path.join(BASE_DIR, "logs"), "aihub 日志", "other", "aihub", True, "medium"),
+        (os.path.join(HOME, ".docker"), "Docker 配置", "container", "Docker", False, "medium"),
+        (os.path.join(HOME, "Library", "Containers", "com.docker.docker"),
+         "Docker 数据", "container", "Docker", False, "high"),
+        (os.path.join(HOME, ".orbstack"), "OrbStack 数据", "container", "OrbStack", False, "high"),
+        (os.path.join(HOME, ".colima"), "Colima 数据", "container", "Colima", False, "high"),
+    )
+    for path, name, category, source, ai, risk in known_dirs:
+        if not os.path.isdir(path):
+            continue
+        add(_asset_record(path, name, category, source, cfg, evidence=path,
+                          ai=ai, risk=risk))
+
+    # 10. 登录项与后台服务
+    labels = set()
+    launch_out = _cmd_text(["launchctl", "list"], 8)
+    for line in (launch_out or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 3:
+            labels.add(parts[2])
+    agents_dir = os.path.join(HOME, "Library", "LaunchAgents")
+    agent_files = sorted(os.listdir(agents_dir)) if os.path.isdir(agents_dir) else []
+    for fn in agent_files:
+        if not fn.endswith(".plist"):
+            continue
+        label = fn[:-6]
+        add(_asset_record(os.path.join(agents_dir, fn), label, "service", "launchd", cfg,
+                          evidence="~/Library/LaunchAgents",
+                          status="running" if label in labels else "stopped",
+                          risk="high" if label in labels else "low"))
+    for name, port, source in (("AI Hub 服务", PORT, "aihub"),
+                               ("Ollama 服务", 11434, "Ollama"),
+                               ("OpenClaw 网关", OPENCLAW_PORT, "OpenClaw")):
+        if port_open(port):
+            add(_asset_record("", name, "service", source, cfg,
+                              evidence="监听端口 %d" % port, status="running",
+                              ai=source != "aihub", virtual=True, risk="high"))
+
+    return assets
+
+
+def assets_summary(items):
+    visible = [ensure_reclaim(dict(i)) for i in (items or [])
+               if isinstance(i, dict) and not i.get("ignored")]
+    total = sum(int(i.get("size") or 0) for i in visible)
+    by_category = {}
+    by_source = {}
+    for it in visible:
+        cat = it.get("category") or "other"
+        src = it.get("source") or "未知"
+        by_category[cat] = by_category.get(cat, 0) + int(it.get("size") or 0)
+        by_source[src] = by_source.get(src, 0) + int(it.get("size") or 0)
+    top = sorted(visible, key=lambda x: int(x.get("size") or 0), reverse=True)[:10]
+    now = time.time()
+    recent = sum(1 for i in visible if i.get("created_ts") and
+                 now - float(i["created_ts"]) <= 7 * 86400)
+    reclaim_size = sum(int(i.get("reclaimable_size") or 0) for i in visible)
+    reclaim_safe_size = sum(int(i.get("size") or 0) for i in visible
+                            if i.get("reclaim_level") == "safe")
+    return {
+        "count": len(visible),
+        "total_size": total,
+        "by_category": by_category,
+        "by_source": by_source,
+        "top": [{"id": i.get("id"), "name": i.get("name"), "category": i.get("category"),
+                 "size": i.get("size"), "path": i.get("path")} for i in top],
+        "recent_count": recent,
+        "ai_count": sum(1 for i in visible if i.get("ai_related")),
+        "in_aihub_count": sum(1 for i in visible if i.get("in_aihub")),
+        "reclaim_count": sum(1 for i in visible if int(i.get("reclaimable_size") or 0) > 0),
+        "reclaim_size": reclaim_size,
+        "reclaim_safe_size": reclaim_safe_size,
+        "reclaim_caution_size": reclaim_size - reclaim_safe_size,
+    }
+
+
+def _load_assets_index():
+    idx = load_json_file(ASSETS_INDEX_FILE, {})
+    if not isinstance(idx, dict):
+        idx = {}
+    if not isinstance(idx.get("items"), list):
+        idx["items"] = []
+    return idx
+
+
+def assets_payload():
+    idx = _load_assets_index()
+    cfg = load_assets_config()
+    items = [ensure_evidence(_apply_user_meta(dict(i), cfg))
+             for i in idx["items"] if isinstance(i, dict)]
+    return {"ok": True, "items": items, "summary": assets_summary(items),
+            "updated": idx.get("updated") or 0,
+            "config": {"roots": cfg["roots"], "exclude": cfg["exclude"]}}
+
+
+_ASSETS_JOB = {"lock": threading.Lock(), "job": None}
+
+
+def assets_job_status(job_id=""):
+    with _ASSETS_JOB["lock"]:
+        job = _ASSETS_JOB["job"]
+        if not job:
+            return {"ok": True, "status": "idle", "step": "尚未扫描", "message": "", "log": []}
+        return {"ok": True, "id": job["id"], "status": job["status"],
+                "step": job["step"], "message": job["message"],
+                "result": job.get("result") or {}, "log": job["log"][-80:]}
+
+
+def _run_assets_scan(job, cfg):
+    def step(text):
+        job["step"] = text
+        job["log"].append(text)
+        if len(job["log"]) > 200:
+            del job["log"][:100]
+
+    try:
+        step("正在读取 aihub 数据")
+        items = collect_assets(cfg)
+        step("正在写入索引")
+        write_json_file(ASSETS_INDEX_FILE, {
+            "updated": time.time(),
+            "items": items,
+            "summary": assets_summary(items),
+        })
+        job["status"] = "done"
+        job["step"] = "扫描完成"
+        job["message"] = "共收录 %d 项资产" % len(items)
+        job["result"] = {"count": len(items)}
+    except Exception as exc:
+        job["status"] = "error"
+        job["step"] = "扫描失败"
+        job["message"] = str(exc)[:300]
+
+
+def handle_assets_scan(payload):
+    cfg = load_assets_config()
+    roots = payload.get("roots")
+    if roots:
+        if isinstance(roots, str):
+            roots = roots.splitlines()
+        cfg["roots"] = [r for r in (normalize_path(x) for x in roots if str(x).strip()) if r]
+    with _ASSETS_JOB["lock"]:
+        job = _ASSETS_JOB["job"]
+        if job and job.get("status") == "running":
+            return {"ok": True, "id": job["id"], "message": "扫描已在进行中"}
+        job = {"id": "a-" + uuid.uuid4().hex[:8], "status": "running",
+               "step": "准备中", "message": "", "log": [], "result": {},
+               "started": time.time()}
+        _ASSETS_JOB["job"] = job
+    threading.Thread(target=_run_assets_scan, args=(job, cfg), daemon=True).start()
+    return {"ok": True, "id": job["id"], "message": "已开始扫描"}
+
+
+def handle_assets_config(payload):
+    cfg = load_assets_config()
+    if "roots" in payload:
+        roots = payload.get("roots")
+        if isinstance(roots, str):
+            roots = roots.splitlines()
+        cfg["roots"] = [r for r in (normalize_path(x) for x in (roots or []) if str(x).strip()) if r] \
+            or list(DEFAULT_SCAN_ROOTS)
+    if "exclude" in payload:
+        excl = payload.get("exclude")
+        if isinstance(excl, str):
+            excl = excl.splitlines()
+        cfg["exclude"] = [str(x).strip() for x in (excl or []) if str(x).strip()]
+    save_assets_config(cfg)
+    return {"ok": True, "config": {"roots": cfg["roots"], "exclude": cfg["exclude"]}}
+
+
+def _assets_update_index(asset_id, field, value):
+    idx = _load_assets_index()
+    changed = False
+    for it in idx["items"]:
+        if it.get("id") == asset_id:
+            it[field] = value
+            changed = True
+    if changed:
+        write_json_file(ASSETS_INDEX_FILE, idx)
+    return changed
+
+
+def handle_assets_ignore(payload):
+    asset_id = str(payload.get("id") or "")
+    if not asset_id:
+        return {"ok": False, "message": "缺少资产 ID"}
+    ignored = bool(payload.get("ignored", True))
+    cfg = load_assets_config()
+    cfg["ignored"][asset_id] = ignored
+    save_assets_config(cfg)
+    _assets_update_index(asset_id, "ignored", ignored)
+    return {"ok": True, "ignored": ignored}
+
+
+def handle_assets_tag(payload):
+    asset_id = str(payload.get("id") or "")
+    if not asset_id:
+        return {"ok": False, "message": "缺少资产 ID"}
+    tags = payload.get("tags") or []
+    if isinstance(tags, str):
+        tags = [x for x in re.split(r"[,，\s]+", tags) if x.strip()]
+    tags = [str(x).strip() for x in tags if str(x).strip()][:20]
+    cfg = load_assets_config()
+    if tags:
+        cfg["tags"][asset_id] = tags
+    else:
+        cfg["tags"].pop(asset_id, None)
+    save_assets_config(cfg)
+    _assets_update_index(asset_id, "tags", tags)
+    return {"ok": True, "tags": tags}
+
+
+def handle_assets_note(payload):
+    asset_id = str(payload.get("id") or "")
+    if not asset_id:
+        return {"ok": False, "message": "缺少资产 ID"}
+    note = str(payload.get("note") or "")[:500]
+    cfg = load_assets_config()
+    if note:
+        cfg["notes"][asset_id] = note
+    else:
+        cfg["notes"].pop(asset_id, None)
+    save_assets_config(cfg)
+    _assets_update_index(asset_id, "note", note)
+    return {"ok": True, "note": note}
+
+
+def handle_assets_snapshot(payload):
+    idx = _load_assets_index()
+    if not idx["items"]:
+        return {"ok": False, "message": "还没有扫描结果，无法保存快照"}
+    try:
+        os.makedirs(ASSETS_SNAPSHOT_DIR, exist_ok=True)
+        base_name = time.strftime("%Y%m%d-%H%M%S")
+        name = base_name + ".json"
+        path = os.path.join(ASSETS_SNAPSHOT_DIR, name)
+        suffix = 1
+        while os.path.exists(path):
+            name = base_name + "-%d.json" % suffix
+            path = os.path.join(ASSETS_SNAPSHOT_DIR, name)
+            suffix += 1
+        write_json_file(path, {
+            "created": time.time(),
+            "summary": idx.get("summary") or assets_summary(idx["items"]),
+            "items": idx["items"],
+        })
+        snaps = sorted(os.listdir(ASSETS_SNAPSHOT_DIR))
+        for old in snaps[:-20]:
+            try:
+                os.remove(os.path.join(ASSETS_SNAPSHOT_DIR, old))
+            except OSError:
+                pass
+        return {"ok": True, "name": name, "message": "快照已保存"}
+    except Exception as exc:
+        return {"ok": False, "message": "保存快照失败：%s" % str(exc)[:200]}
+
+
+# ---- 快照差异（P1）----
+
+SNAPSHOT_NAME_RE = re.compile(r"^\d{8}-\d{6}(?:-\d+)?\.json$")
+DIFF_MIN_SIZE_DELTA = 1024  # 小于 1KB 的大小变化视为噪声
+DIFF_FIELDS = (
+    ("size", "大小"), ("file_count", "文件数"), ("name", "名称"),
+    ("category", "类别"), ("path", "路径"), ("source", "来源"),
+    ("status", "状态"), ("ai_related", "AI 相关"), ("in_aihub", "aihub 收录"),
+    ("reclaimable_size", "可回收大小"), ("reclaim_label", "回收建议"),
+    ("tags", "标签"), ("note", "备注"), ("ignored", "已忽略"),
+)
+DIFF_BRIEF_KEYS = ("id", "name", "category", "path", "size", "file_count",
+                   "source", "status", "ai_related", "in_aihub", "tags",
+                   "note", "ignored", "created", "modified")
+
+
+def _snapshot_path(name):
+    """只允许访问 assets.snapshots/ 下约定格式的文件，避免路径穿越。"""
+    base = os.path.basename(str(name or ""))
+    if not SNAPSHOT_NAME_RE.match(base):
+        return ""
+    return os.path.join(ASSETS_SNAPSHOT_DIR, base)
+
+
+def _snapshot_items(name):
+    """返回 (items, timestamp)；快照不存在或损坏时 items 为 None。"""
+    if name == "current":
+        idx = _load_assets_index()
+        cfg = load_assets_config()
+        items = [ensure_evidence(_apply_user_meta(dict(i), cfg))
+                 for i in idx["items"] if isinstance(i, dict)]
+        return items, float(idx.get("updated") or 0)
+    path = _snapshot_path(name)
+    if not path or not os.path.isfile(path):
+        return None, 0
+    try:
+        snap = load_json_file(path, {})
+        raw = snap.get("items") or []
+        return [ensure_evidence(dict(i)) for i in raw if isinstance(i, dict)], \
+            float(snap.get("created") or 0)
+    except Exception:
+        return None, 0
+
+
+def assets_snapshots_payload():
+    out = []
+    if os.path.isdir(ASSETS_SNAPSHOT_DIR):
+        for name in sorted(os.listdir(ASSETS_SNAPSHOT_DIR), reverse=True):
+            path = _snapshot_path(name)
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+                snap = load_json_file(path, {})
+                items = snap.get("items") or []
+                summary = snap.get("summary") or assets_summary(items)
+                out.append({
+                    "name": name,
+                    "created": float(snap.get("created") or st.st_mtime),
+                    "count": len(items),
+                    "total_size": int(summary.get("total_size") or 0),
+                    "file_size": int(st.st_size),
+                })
+            except Exception:
+                continue
+    return {"ok": True, "snapshots": out, "limit": 20}
+
+
+def handle_assets_snapshot_delete(payload):
+    name = str(payload.get("name") or "")
+    path = _snapshot_path(name)
+    if not path:
+        return {"ok": False, "message": "快照名称不合法"}
+    if not os.path.isfile(path):
+        return {"ok": False, "message": "快照不存在"}
+    try:
+        os.remove(path)
+        return {"ok": True, "message": "快照已删除"}
+    except OSError as exc:
+        return {"ok": False, "message": "删除失败：%s" % str(exc)[:200]}
+
+
+def _diff_value(rec, field):
+    value = rec.get(field)
+    if field == "tags":
+        return ",".join(str(x) for x in (value or []))
+    if field in ("size", "file_count", "reclaimable_size"):
+        return int(value or 0)
+    if field in ("ai_related", "in_aihub", "ignored"):
+        return bool(value)
+    return str(value or "")
+
+
+def _asset_diff_changes(before, after):
+    changes = []
+    for field, label in DIFF_FIELDS:
+        old_v = _diff_value(before, field)
+        new_v = _diff_value(after, field)
+        if field == "size":
+            delta = new_v - old_v
+            if delta:
+                changes.append({"field": field, "label": label,
+                                "before": old_v, "after": new_v, "delta": delta})
+        elif old_v != new_v:
+            changes.append({"field": field, "label": label,
+                            "before": old_v, "after": new_v})
+    size_delta = next((c["delta"] for c in changes if c["field"] == "size"), 0)
+    return changes, size_delta
+
+
+def _diff_brief(rec):
+    if not rec:
+        return None
+    return {k: rec.get(k) for k in DIFF_BRIEF_KEYS}
+
+
+def _diff_row(kind, asset_id, before, after, changes=None, delta=0):
+    main = after or before or {}
+    return {
+        "id": asset_id,
+        "kind": kind,
+        "name": main.get("name") or os.path.basename(str(main.get("path") or "")) or asset_id,
+        "category": main.get("category") or "other",
+        "path": main.get("path") or "",
+        "delta": int(delta or 0),
+        "before": _diff_brief(before),
+        "after": _diff_brief(after),
+        "changes": (changes or [])[:16],
+    }
+
+
+def assets_diff_payload(base=None, target=None):
+    """对比两个快照（或快照与当前清单）；base 为旧，target 为新。"""
+    base = str(base or "current")
+    target = str(target or "current")
+    if base == target:
+        return {"ok": False, "message": "请选择两个不同的对比对象"}
+    old_items, old_ts = _snapshot_items(base)
+    new_items, new_ts = _snapshot_items(target)
+    if old_items is None:
+        return {"ok": False, "message": "基准快照不存在或已损坏"}
+    if new_items is None:
+        return {"ok": False, "message": "对比快照不存在或已损坏"}
+
+    def index(items):
+        out = {}
+        for it in items:
+            rid = str(it.get("id") or it.get("path") or it.get("name") or "")
+            if rid:
+                out[rid] = it
+        return out
+
+    def visible_total(items):
+        return sum(int(i.get("size") or 0) for i in items if not i.get("ignored"))
+
+    old_map, new_map = index(old_items), index(new_items)
+    summary = {"added": 0, "removed": 0, "increased": 0, "decreased": 0,
+               "changed": 0, "added_size": 0, "removed_size": 0,
+               "total_before": visible_total(old_items),
+               "total_after": visible_total(new_items)}
+    rows = []
+    for rid, before in old_map.items():
+        after = new_map.get(rid)
+        if after is None:
+            summary["removed"] += 1
+            summary["removed_size"] += int(before.get("size") or 0)
+            rows.append(_diff_row("removed", rid, before, None))
+            continue
+        changes, delta = _asset_diff_changes(before, after)
+        size_change = any(c["field"] == "size" for c in changes)
+        if size_change and abs(delta) >= DIFF_MIN_SIZE_DELTA:
+            kind = "increased" if delta > 0 else "decreased"
+        elif changes:
+            kind = "changed"
+        else:
+            continue
+        summary[kind] += 1
+        rows.append(_diff_row(kind, rid, before, after, changes, delta))
+    for rid, after in new_map.items():
+        if rid in old_map:
+            continue
+        summary["added"] += 1
+        summary["added_size"] += int(after.get("size") or 0)
+        rows.append(_diff_row("added", rid, None, after, delta=after.get("size") or 0))
+    summary["size_delta"] = summary["total_after"] - summary["total_before"]
+    rows.sort(key=lambda r: abs(r.get("delta") or 0), reverse=True)
+    return {
+        "ok": True, "base": base, "target": target,
+        "base_time": old_ts, "target_time": new_ts,
+        "summary": summary, "rows": rows[:1000],
+        "truncated": len(rows) > 1000,
+        "min_delta": DIFF_MIN_SIZE_DELTA,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
@@ -5432,6 +6427,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(MODELS_PAGE, "text/html; charset=utf-8")
         elif path in ("/tools", "/tools.html"):
             self._send(TOOLS_PAGE, "text/html; charset=utf-8")
+        elif path in ("/assets", "/assets.html"):
+            self._send(ASSETS_PAGE, "text/html; charset=utf-8")
+        elif path == "/api/assets":
+            self._json(assets_payload())
+        elif path == "/api/assets/summary":
+            self._json(assets_payload()["summary"])
+        elif path == "/api/assets/job":
+            q = parse_qs(urlparse(self.path).query)
+            self._json(assets_job_status((q.get("id") or [""])[0]))
+        elif path == "/api/assets/snapshots":
+            self._json(assets_snapshots_payload())
+        elif path == "/api/assets/diff":
+            q = parse_qs(urlparse(self.path).query)
+            self._json(assets_diff_payload((q.get("base") or [""])[0],
+                                           (q.get("target") or [""])[0]))
         elif path == "/api/status":
             self._json(collect_status())
         elif path == "/api/ai/tools":
@@ -5514,6 +6524,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(kill_listener_process(payload.get("pid")))
         elif self.path == "/api/projects/scan":
             self._json(handle_project_scan(payload))
+        elif self.path == "/api/assets/scan":
+            self._json(handle_assets_scan(payload))
+        elif self.path == "/api/assets/config":
+            self._json(handle_assets_config(payload))
+        elif self.path == "/api/assets/ignore":
+            self._json(handle_assets_ignore(payload))
+        elif self.path == "/api/assets/tag":
+            self._json(handle_assets_tag(payload))
+        elif self.path == "/api/assets/note":
+            self._json(handle_assets_note(payload))
+        elif self.path == "/api/assets/snapshot":
+            self._json(handle_assets_snapshot(payload))
+        elif self.path == "/api/assets/snapshot/delete":
+            self._json(handle_assets_snapshot_delete(payload))
         elif self.path == "/api/projects/import":
             self._json(handle_project_import(payload))
         elif self.path == "/api/github/inspect":
@@ -5755,18 +6779,18 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
 <title>AI Hub · 项目</title>
 <style>
   :root{
-    --bg:#F5F4F1; --panel:#FFFFFF; --surface:#F0EFEA; --text:#17160F; --muted:#6E6B63;
-    --line:rgba(24,22,18,.12); --line-strong:rgba(24,22,18,.24);
-    --brand:#0AB861; --brand-ink:#06743F; --brand-soft:#E5FBF0;
-    --danger:#C43A2E; --warn:#A2610A;
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4; --text:#1E293B; --muted:#64748B;
+    --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --danger:#DC2626; --warn:#B45309;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
     --ease:cubic-bezier(.2,.8,.2,1);
   }
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0D0D0F; --panel:#16161A; --surface:#1F1F24; --text:#ECECEE; --muted:#98979A;
-           --line:rgba(236,236,238,.12); --line-strong:rgba(236,236,238,.26);
-           --brand:#32F08C; --brand-ink:#32F08C; --brand-soft:#0A2A1B;
-           --danger:#FF6B60; --warn:#E8A34A; }
+    :root{ --bg:#0F172A; --panel:#1E293B; --surface:#334155; --text:#F1F5F9; --muted:#94A3B8;
+           --line:#475569; --line-strong:#64748B;
+           --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+           --danger:#F87171; --warn:#FBBF24; }
   }
   *{ box-sizing:border-box; }
   html,body{ margin:0; min-height:100%; }
@@ -6210,21 +7234,21 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
   /* == MINIMAL-TOPNAV v2 == */
   /* 极简灰阶（Tailwind Zinc）：保留原变量名，仅覆盖色值，确保组件样式自动继承 */
   :root{
-    --bg:#FAFAFA; --panel:#FFFFFF; --surface:#F4F4F5;
-    --text:#18181B; --muted:#71717A; --faint:#A1A1AA;
-    --line:#E4E4E7; --line-strong:#D4D4D8;
-    --brand:#15803D; --brand-ink:#15803D; --brand-soft:#E8F5EC;
-    --ok:#15803D; --ok-soft:#E8F5EC; --off:#A1A1AA;
-    --danger:#B42318; --warn:#A2610A;
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4;
+    --text:#1E293B; --muted:#64748B; --faint:#94A3B8;
+    --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --ok:#15803D; --ok-soft:#E8F5EC; --off:#94A3B8;
+    --danger:#DC2626; --warn:#B45309;
   }
   @media (prefers-color-scheme: dark){
     :root{
-      --bg:#09090B; --panel:#18181B; --surface:#27272A;
-      --text:#FAFAFA; --muted:#A1A1AA; --faint:#71717A;
-      --line:#3F3F46; --line-strong:#52525B;
-      --brand:#34D399; --brand-ink:#34D399; --brand-soft:#12261F;
-      --ok:#34D399; --ok-soft:#12261F; --off:#71717A;
-      --danger:#F87171; --warn:#E8A34A;
+      --bg:#0F172A; --panel:#1E293B; --surface:#334155;
+      --text:#F1F5F9; --muted:#94A3B8; --faint:#64748B;
+      --line:#475569; --line-strong:#64748B;
+      --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+      --ok:#34D399; --ok-soft:#12261F; --off:#64748B;
+      --danger:#F87171; --warn:#FBBF24;
     }
   }
   /* 顶栏：把原左侧 rail 翻成横向 header，分组/筛选并排主区 */
@@ -6250,13 +7274,13 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
     flex:0 1 auto; flex-direction:row; flex-wrap:wrap; gap:4px;
     overflow:visible; min-height:0; align-items:center;
   }
-  .row{
+  #groups .row, #filters .row{
     display:inline-flex; align-items:center; gap:6px;
     padding:3px 10px; font-size:11.5px; white-space:nowrap;
     border:1px solid var(--line); border-radius:999px; background:transparent;
   }
-  .row.on{ background:var(--text); color:var(--panel); border-color:var(--text); font-weight:600; }
-  .row .dot{ width:6px; height:6px; margin-top:0; }
+  #groups .row.on, #filters .row.on{ background:var(--text); color:var(--panel); border-color:var(--text); font-weight:600; }
+  #groups .row .dot, #filters .row .dot{ width:6px; height:6px; margin-top:0; }
   .dot{ box-shadow:none !important; }
   .rail-foot{
     margin:0 0 0 auto; padding:0; border:0; display:flex;
@@ -6272,6 +7296,9 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
   .btn:hover{ transform:none; }
   .btn.primary{ background:var(--text); border-color:var(--text); color:var(--panel); }
   /* v2 新增：卡片网格改为自适应列宽——卡片少时自动变宽铺满，卡片多时自然分列 */
+  /* v3：未分组项目各自是一层 .group-grid（一组一卡），用 contents 拆掉包裹层，让所有卡片进入同一个网格并排 */
+  #grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; }
+  #grid > .group-grid{ display:contents; }
   .group-grid{ grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch; }
   .group-grid > .card{ width:100%; min-width:0; }
   /* 窄屏：顶栏自然换行，不做图标栏收缩 */
@@ -6280,7 +7307,7 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
     .brand span:last-child, .nav-btn span:not(.kbd), .nav-btn .kbd, .sec, .rail-foot,
     .row .n, .row .m{ display:inline !important; }
     .nav-btn{ justify-content:flex-start; padding:7px 12px; }
-    .row{ justify-content:flex-start; padding:3px 10px; }
+    #groups .row, #filters .row{ justify-content:flex-start; padding:3px 10px; }
   }
   /* == END MINIMAL-TOPNAV v2 == */
   </style>
@@ -6301,6 +7328,10 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
       <a class="nav-btn" href="/tools">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 2.5l3 3-2 2-3-3zM8.5 4.5L2.5 10.5v3h3l6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>工具</span><span class="kbd">⌘3</span>
+      </a>
+      <a class="nav-btn" href="/assets">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><path d="M4.5 5h.01M4.5 11h.01" stroke-linecap="round"/></svg>
+        <span>资产</span><span class="kbd">⌘4</span>
       </a>
     </div>
     <div class="rail-sep"></div>
@@ -6374,7 +7405,7 @@ PROJECTS_PAGE = r"""<!DOCTYPE html>
   <div class="sheet wide">
     <div class="sheet-head"><h3 id="scanTitle">扫描项目</h3><button class="x" data-close="scanModal">✕</button></div>
     <div class="sheet-body">
-      <label class="field">扫描目录（每行一个）<textarea id="scanRoots" rows="3" placeholder="~/Documents"></textarea></label>
+      <label class="field">扫描目录（每行一个）<textarea id="scanRoots" rows="3" placeholder="~/code"></textarea></label>
       <div class="scan-bar">
         <button class="btn" id="scanRun">开始扫描</button>
         <span class="hint" id="scanStatus">支持 Node / Spring / Django / Go / Rust / Docker 等常见项目</span>
@@ -6595,7 +7626,7 @@ function envFixCard(env, p){
           (o.recommended ? " checked" : "") +
           ' data-act="env-opt" data-fix="' + i + '" data-opt="' + j + '">' +
         '<span class="env-opt-name">' + esc(o.tool) +
-          (o.available ? ' <span class="tag brand">已装</span>' : ' <span class="tag">未装</span>') +
+          (o.available ? ' <span class="tag">已装</span>' : ' <span class="tag">未装</span>') +
           (o.recommended ? ' <span class="tag warn">推荐</span>' : "") +
         "</span>" +
         '<code class="env-opt-cmd">' + esc(o.command) + "</code>" +
@@ -7131,7 +8162,7 @@ function openScan(){
   $("#scanTitle").textContent = "扫描项目";
   $("#scanRoots").closest(".field").hidden = false;
   $("#scanRun").hidden = false;
-  if (!$("#scanRoots").value) $("#scanRoots").value = "~/Documents\n~/Projects\n~/code\n~/Desktop";
+  if (!$("#scanRoots").value) $("#scanRoots").value = "~/code\n~/Projects\n~/workspace";
   openModal("scanModal");
 }
 
@@ -7873,9 +8904,9 @@ document.addEventListener("keydown", e => {
     if (!$("#diag").hidden) closeDiag();
     document.querySelectorAll(".modal.show").forEach(m => closeModal(m.id));
   }
-  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3"].includes(e.key)){
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3", "4"].includes(e.key)){
     e.preventDefault();
-    location.href = { "1": "/projects", "2": "/models", "3": "/tools" }[e.key];
+    location.href = { "1": "/projects", "2": "/models", "3": "/tools", "4": "/assets" }[e.key];
   }
 });
 
@@ -7920,7 +8951,7 @@ $("#scanAll").onchange = e => {
   document.querySelectorAll("#scanList input[type=checkbox]:not(:disabled)")
     .forEach(el => el.checked = e.target.checked);
 };
-$("#scanRoots").value = "~/Documents\n~/Projects\n~/code\n~/Desktop";
+$("#scanRoots").value = "~/code\n~/Projects\n~/workspace";
 
 refresh();
 setInterval(refresh, 4000);
@@ -7939,18 +8970,18 @@ MODELS_PAGE = r"""<!DOCTYPE html>
 <title>AI Hub · 模型</title>
 <style>
   :root{
-    --bg:#F5F4F1; --panel:#FFFFFF; --surface:#F0EFEA; --text:#17160F; --muted:#6E6B63;
-    --faint:#9A968C; --line:rgba(24,22,18,.12); --line-strong:rgba(24,22,18,.24);
-    --brand:#0AB861; --brand-ink:#06743F; --brand-soft:#E5FBF0;
-    --danger:#C43A2E; --warn:#A2610A;
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4; --text:#1E293B; --muted:#64748B;
+    --faint:#94A3B8; --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --danger:#DC2626; --warn:#B45309;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
     --ease:cubic-bezier(.2,.8,.2,1);
   }
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0D0D0F; --panel:#16161A; --surface:#1F1F24; --text:#ECECEE; --muted:#98979A;
-           --faint:#6F6E72; --line:rgba(236,236,238,.12); --line-strong:rgba(236,236,238,.26);
-           --brand:#32F08C; --brand-ink:#32F08C; --brand-soft:#0A2A1B;
-           --danger:#FF6B60; --warn:#E8A34A; }
+    :root{ --bg:#0F172A; --panel:#1E293B; --surface:#334155; --text:#F1F5F9; --muted:#94A3B8;
+           --faint:#64748B; --line:#475569; --line-strong:#64748B;
+           --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+           --danger:#F87171; --warn:#FBBF24; }
   }
   *{ box-sizing:border-box; }
   html,body{ margin:0; min-height:100%; }
@@ -8034,6 +9065,9 @@ MODELS_PAGE = r"""<!DOCTYPE html>
   .chips{ display:flex; flex-wrap:wrap; gap:4px; max-width:320px; }
   .mchip{ font-family:var(--mono); font-size:10.5px; background:var(--surface); color:var(--muted);
     border:1px solid var(--line); border-radius:5px; padding:1px 6px; white-space:nowrap; }
+  .chip-more{ font-family:var(--mono); font-size:10.5px; color:var(--brand-ink); background:transparent;
+    border:1px dashed var(--line); border-radius:5px; padding:1px 6px; cursor:pointer; white-space:nowrap; }
+  .chip-more:hover{ background:var(--surface); }
   .mtag{ font-size:9px; color:var(--brand-ink); border:1px solid var(--line);
     border-radius:4px; padding:0 3px; margin-left:4px; }
   .labrow{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
@@ -8120,21 +9154,21 @@ MODELS_PAGE = r"""<!DOCTYPE html>
   /* == MINIMAL-TOPNAV v2 == */
   /* 极简灰阶（Tailwind Zinc）：保留原变量名，仅覆盖色值，确保组件样式自动继承 */
   :root{
-    --bg:#FAFAFA; --panel:#FFFFFF; --surface:#F4F4F5;
-    --text:#18181B; --muted:#71717A; --faint:#A1A1AA;
-    --line:#E4E4E7; --line-strong:#D4D4D8;
-    --brand:#15803D; --brand-ink:#15803D; --brand-soft:#E8F5EC;
-    --ok:#15803D; --ok-soft:#E8F5EC; --off:#A1A1AA;
-    --danger:#B42318; --warn:#A2610A;
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4;
+    --text:#1E293B; --muted:#64748B; --faint:#94A3B8;
+    --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --ok:#15803D; --ok-soft:#E8F5EC; --off:#94A3B8;
+    --danger:#DC2626; --warn:#B45309;
   }
   @media (prefers-color-scheme: dark){
     :root{
-      --bg:#09090B; --panel:#18181B; --surface:#27272A;
-      --text:#FAFAFA; --muted:#A1A1AA; --faint:#71717A;
-      --line:#3F3F46; --line-strong:#52525B;
-      --brand:#34D399; --brand-ink:#34D399; --brand-soft:#12261F;
-      --ok:#34D399; --ok-soft:#12261F; --off:#71717A;
-      --danger:#F87171; --warn:#E8A34A;
+      --bg:#0F172A; --panel:#1E293B; --surface:#334155;
+      --text:#F1F5F9; --muted:#94A3B8; --faint:#64748B;
+      --line:#475569; --line-strong:#64748B;
+      --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+      --ok:#34D399; --ok-soft:#12261F; --off:#64748B;
+      --danger:#F87171; --warn:#FBBF24;
     }
   }
   /* 顶栏：把原左侧 rail 翻成横向 header，分组/筛选并排主区 */
@@ -8160,13 +9194,13 @@ MODELS_PAGE = r"""<!DOCTYPE html>
     flex:0 1 auto; flex-direction:row; flex-wrap:wrap; gap:4px;
     overflow:visible; min-height:0; align-items:center;
   }
-  .row{
+  #groups .row, #filters .row{
     display:inline-flex; align-items:center; gap:6px;
     padding:3px 10px; font-size:11.5px; white-space:nowrap;
     border:1px solid var(--line); border-radius:999px; background:transparent;
   }
-  .row.on{ background:var(--text); color:var(--panel); border-color:var(--text); font-weight:600; }
-  .row .dot{ width:6px; height:6px; margin-top:0; }
+  #groups .row.on, #filters .row.on{ background:var(--text); color:var(--panel); border-color:var(--text); font-weight:600; }
+  #groups .row .dot, #filters .row .dot{ width:6px; height:6px; margin-top:0; }
   .dot{ box-shadow:none !important; }
   .rail-foot{
     margin:0 0 0 auto; padding:0; border:0; display:flex;
@@ -8182,6 +9216,9 @@ MODELS_PAGE = r"""<!DOCTYPE html>
   .btn:hover{ transform:none; }
   .btn.primary{ background:var(--text); border-color:var(--text); color:var(--panel); }
   /* v2 新增：卡片网格改为自适应列宽——卡片少时自动变宽铺满，卡片多时自然分列 */
+  /* v3：未分组项目各自是一层 .group-grid（一组一卡），用 contents 拆掉包裹层，让所有卡片进入同一个网格并排 */
+  #grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; }
+  #grid > .group-grid{ display:contents; }
   .group-grid{ grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch; }
   .group-grid > .card{ width:100%; min-width:0; }
   /* 窄屏：顶栏自然换行，不做图标栏收缩 */
@@ -8190,7 +9227,7 @@ MODELS_PAGE = r"""<!DOCTYPE html>
     .brand span:last-child, .nav-btn span:not(.kbd), .nav-btn .kbd, .sec, .rail-foot,
     .row .n, .row .m{ display:inline !important; }
     .nav-btn{ justify-content:flex-start; padding:7px 12px; }
-    .row{ justify-content:flex-start; padding:3px 10px; }
+    #groups .row, #filters .row{ justify-content:flex-start; padding:3px 10px; }
   }
   /* == END MINIMAL-TOPNAV v2 == */
   </style>
@@ -8211,6 +9248,10 @@ MODELS_PAGE = r"""<!DOCTYPE html>
       <a class="nav-btn" href="/tools">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 2.5l3 3-2 2-3-3zM8.5 4.5L2.5 10.5v3h3l6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>工具</span><span class="kbd">⌘3</span>
+      </a>
+      <a class="nav-btn" href="/assets">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><path d="M4.5 5h.01M4.5 11h.01" stroke-linecap="round"/></svg>
+        <span>资产</span><span class="kbd">⌘4</span>
       </a>
     </div>
     <div class="rail-sep"></div>
@@ -8475,10 +9516,20 @@ function capTags(m){
   return out;
 }
 
+const MODEL_LIMIT = 3;
+const expandedChips = new Set();
+
 function row(a){
   const st = STATUS[a.status] || STATUS.ok;
-  const chips = (a.models || []).length
-    ? a.models.map(m => '<span class="mchip" title="' + esc(m.model_id) + '">' + esc(m.name) + capTags(m) + '</span>').join("")
+  const models = a.models || [];
+  const open = expandedChips.has(a.id);
+  const visible = open ? models : models.slice(0, MODEL_LIMIT);
+  const chips = models.length
+    ? visible.map(m => '<span class="mchip" title="' + esc(m.model_id) + '">' + esc(m.name) + capTags(m) + '</span>').join("") +
+      (models.length > MODEL_LIMIT
+        ? '<button class="chip-more" data-act="chip-more" data-id="' + esc(a.id) + '">' +
+          (open ? "收起" : "+" + (models.length - MODEL_LIMIT)) + '</button>'
+        : "")
     : '<span class="faint">未填写</span>';
   return '<tr data-id="' + esc(a.id) + '">' +
     '<td><div class="vendor">' + esc(a.vendor) + '<span class="proto">' + esc(a.protocol || "openai") + '</span></div>' +
@@ -8521,6 +9572,11 @@ function bindOps(){
       if (btn.dataset.act === "edit") openEdit(a);
       if (btn.dataset.act === "copy") copyKey(a);
       if (btn.dataset.act === "del") removeAccount(a);
+      if (btn.dataset.act === "chip-more"){
+        if (expandedChips.has(a.id)) expandedChips.delete(a.id); else expandedChips.add(a.id);
+        render();
+        return;
+      }
     };
   });
 }
@@ -8798,9 +9854,9 @@ document.querySelectorAll("[data-close]").forEach(el => { el.onclick = closeEdit
 $("#editModal").addEventListener("click", e => { if (e.target.id === "editModal") closeEdit(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") closeEdit();
-  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3"].includes(e.key)){
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3", "4"].includes(e.key)){
     e.preventDefault();
-    location.href = { "1": "/projects", "2": "/models", "3": "/tools" }[e.key];
+    location.href = { "1": "/projects", "2": "/models", "3": "/tools", "4": "/assets" }[e.key];
   }
 });
 $("#addBtn").onclick = () => openEdit(null);
@@ -8831,17 +9887,17 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
 <title>AI Hub · 工具</title>
 <style>
   :root{
-    --bg:#F5F4F1; --panel:#FFFFFF; --surface:#F0EFEA; --text:#17160F; --muted:#6E6B63;
-    --faint:#9C998F; --line:rgba(24,22,18,.12); --line-strong:rgba(24,22,18,.24);
-    --brand:#0AB861; --brand-ink:#06743F; --brand-soft:#E5FBF0;
-    --danger:#C43A2E; --warn:#A2610A;
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4; --text:#1E293B; --muted:#64748B;
+    --faint:#94A3B8; --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --danger:#DC2626; --warn:#B45309;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
   }
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0D0D0F; --panel:#16161A; --surface:#1F1F24; --text:#ECECEE; --muted:#98979A;
-           --faint:#6E6D72; --line:rgba(236,236,238,.12); --line-strong:rgba(236,236,238,.26);
-           --brand:#2BD98A; --brand-ink:#7BE8B6; --brand-soft:rgba(43,217,138,.12);
-           --danger:#E06A5E; --warn:#D89B45; }
+    :root{ --bg:#0F172A; --panel:#1E293B; --surface:#334155; --text:#F1F5F9; --muted:#94A3B8;
+           --faint:#64748B; --line:#475569; --line-strong:#64748B;
+           --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+           --danger:#F87171; --warn:#FBBF24; }
   }
   *{ box-sizing:border-box; }
   html,body{ margin:0; height:100%; }
@@ -8890,14 +9946,15 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
   .row{ display:flex; align-items:center; gap:12px; padding:11px 16px; border-top:1px solid var(--line); }
   .row:first-child{ border-top:0; }
   .row .dot{ width:7px; height:7px; border-radius:50%; background:var(--faint); flex:0 0 auto; }
-  .row .dot.on{ background:var(--brand); box-shadow:0 0 0 3px var(--brand-soft); }
+  .row .dot.on{ background:var(--ok); box-shadow:0 0 0 3px var(--ok-soft); }
   .row .name{ font-weight:600; font-size:12.5px; min-width:120px; }
   .row .detail{ color:var(--muted); font-size:11.5px; font-family:var(--mono); overflow:hidden;
                 text-overflow:ellipsis; white-space:nowrap; }
   .row .spacer{ margin-left:auto; }
   .row .ops{ display:flex; gap:6px; flex:0 0 auto; }
-  .tag{ font-size:10px; padding:1px 6px; border-radius:5px; background:var(--surface);
-        color:var(--muted); border:1px solid var(--line); white-space:nowrap; }
+  .tag{ font-size:9px; padding:1px 5px; border-radius:4px; background:var(--surface);
+        color:var(--muted); border:1px solid var(--line); white-space:nowrap; text-align:center;
+        min-width:46px; }
   .tag.brand{ color:var(--brand-ink); background:var(--brand-soft); border-color:transparent; }
   .tag.warn{ color:var(--warn); }
   .empty-row{ padding:22px 16px; color:var(--muted); font-size:12px; text-align:center; }
@@ -8934,7 +9991,7 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
   .f2{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   .check{ display:flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
   .sheet-foot{ display:flex; justify-content:flex-end; gap:8px; padding:12px 18px 16px; border-top:1px solid var(--line); }
-  .toast{ position:fixed; left:50%; bottom:26px; transform:translate(-50%,10px); background:#17160F; color:#fff;
+  .toast{ position:fixed; left:50%; bottom:26px; transform:translate(-50%,10px); background:#0F172A; color:#fff;
           padding:8px 14px; border-radius:8px; font-size:12px; opacity:0; pointer-events:none;
           transition:.22s ease; z-index:40; }
   .toast.show{ opacity:1; transform:translate(-50%,0); }
@@ -8951,21 +10008,21 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
   /* == MINIMAL-TOPNAV v2 == */
   /* 极简灰阶（Tailwind Zinc）：保留原变量名，仅覆盖色值，确保组件样式自动继承 */
   :root{
-    --bg:#FAFAFA; --panel:#FFFFFF; --surface:#F4F4F5;
-    --text:#18181B; --muted:#71717A; --faint:#A1A1AA;
-    --line:#E4E4E7; --line-strong:#D4D4D8;
-    --brand:#15803D; --brand-ink:#15803D; --brand-soft:#E8F5EC;
-    --ok:#15803D; --ok-soft:#E8F5EC; --off:#A1A1AA;
-    --danger:#B42318; --warn:#A2610A;
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4;
+    --text:#1E293B; --muted:#64748B; --faint:#94A3B8;
+    --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --ok:#15803D; --ok-soft:#E8F5EC; --off:#94A3B8;
+    --danger:#DC2626; --warn:#B45309;
   }
   @media (prefers-color-scheme: dark){
     :root{
-      --bg:#09090B; --panel:#18181B; --surface:#27272A;
-      --text:#FAFAFA; --muted:#A1A1AA; --faint:#71717A;
-      --line:#3F3F46; --line-strong:#52525B;
-      --brand:#34D399; --brand-ink:#34D399; --brand-soft:#12261F;
-      --ok:#34D399; --ok-soft:#12261F; --off:#71717A;
-      --danger:#F87171; --warn:#E8A34A;
+      --bg:#0F172A; --panel:#1E293B; --surface:#334155;
+      --text:#F1F5F9; --muted:#94A3B8; --faint:#64748B;
+      --line:#475569; --line-strong:#64748B;
+      --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+      --ok:#34D399; --ok-soft:#12261F; --off:#64748B;
+      --danger:#F87171; --warn:#FBBF24;
     }
   }
   /* 顶栏：把原左侧 rail 翻成横向 header，分组/筛选并排主区 */
@@ -8991,13 +10048,13 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
     flex:0 1 auto; flex-direction:row; flex-wrap:wrap; gap:4px;
     overflow:visible; min-height:0; align-items:center;
   }
-  .row{
+  #groups .row, #filters .row{
     display:inline-flex; align-items:center; gap:6px;
     padding:3px 10px; font-size:11.5px; white-space:nowrap;
     border:1px solid var(--line); border-radius:999px; background:transparent;
   }
-  .row.on{ background:var(--text); color:var(--panel); border-color:var(--text); font-weight:600; }
-  .row .dot{ width:6px; height:6px; margin-top:0; }
+  #groups .row.on, #filters .row.on{ background:var(--text); color:var(--panel); border-color:var(--text); font-weight:600; }
+  #groups .row .dot, #filters .row .dot{ width:6px; height:6px; margin-top:0; }
   .dot{ box-shadow:none !important; }
   .rail-foot{
     margin:0 0 0 auto; padding:0; border:0; display:flex;
@@ -9013,6 +10070,9 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
   .btn:hover{ transform:none; }
   .btn.primary{ background:var(--text); border-color:var(--text); color:var(--panel); }
   /* v2 新增：卡片网格改为自适应列宽——卡片少时自动变宽铺满，卡片多时自然分列 */
+  /* v3：未分组项目各自是一层 .group-grid（一组一卡），用 contents 拆掉包裹层，让所有卡片进入同一个网格并排 */
+  #grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; }
+  #grid > .group-grid{ display:contents; }
   .group-grid{ grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch; }
   .group-grid > .card{ width:100%; min-width:0; }
   /* 窄屏：顶栏自然换行，不做图标栏收缩 */
@@ -9021,7 +10081,7 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
     .brand span:last-child, .nav-btn span:not(.kbd), .nav-btn .kbd, .sec, .rail-foot,
     .row .n, .row .m{ display:inline !important; }
     .nav-btn{ justify-content:flex-start; padding:7px 12px; }
-    .row{ justify-content:flex-start; padding:3px 10px; }
+    #groups .row, #filters .row{ justify-content:flex-start; padding:3px 10px; }
   }
   /* == END MINIMAL-TOPNAV v2 == */
   </style>
@@ -9042,6 +10102,10 @@ TOOLS_PAGE = r"""<!DOCTYPE html>
       <a class="nav-btn is-active" href="/tools">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 2.5l3 3-2 2-3-3zM8.5 4.5L2.5 10.5v3h3l6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>工具</span><span class="kbd">⌘3</span>
+      </a>
+      <a class="nav-btn" href="/assets">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><path d="M4.5 5h.01M4.5 11h.01" stroke-linecap="round"/></svg>
+        <span>资产</span><span class="kbd">⌘4</span>
       </a>
     </div>
     <div class="rail-sep"></div>
@@ -9185,13 +10249,13 @@ function claudeBindRows(){
 
   let stateTag = '<span class="tag">未绑定</span>';
   if (b){
-    if (st.state === "synced") stateTag = '<span class="tag brand">已同步</span>';
+    if (st.state === "synced") stateTag = '<span class="tag">已同步</span>';
     else if (st.state === "drift") stateTag = '<span class="tag warn">配置被外部修改</span>';
     else if (st.state === "missing") stateTag = '<span class="tag warn">配置缺失</span>';
     else if (st.state === "invalid") stateTag = '<span class="tag warn">配置无法解析</span>';
   }
   const verifyTag = verify.at
-    ? '<span class="tag ' + (verify.ok ? "brand" : "warn") + '" title="' + esc(verify.message || "") + '">' +
+    ? '<span class="tag' + (verify.ok ? "" : " warn") + '" title="' + esc(verify.message || "") + '">' +
       (verify.ok ? "已验证" : "验证失败") + " · " + timeAgo(verify.at) + "</span>"
     : '<span class="tag">未验证</span>';
 
@@ -9275,7 +10339,7 @@ function wireClaudeBind(){
 function builtinRows(){
   const rows = data.tools.filter(t => t.kind !== "custom");
   return rows.map(t => {
-    const caps = t.files ? '<span class="tag brand">可读代码</span>' : '<span class="tag">仅上下文</span>';
+    const caps = t.files ? '<span class="tag">可读代码</span>' : '<span class="tag">仅上下文</span>';
     return '<div class="row">' +
       '<span class="dot' + (t.available ? " on" : "") + '"></span>' +
       '<span class="name">' + esc(t.label) + "</span>" + caps +
@@ -9296,7 +10360,7 @@ function envRows(){
       '<span class="name">' + esc(r.label) + "</span>" +
       '<span class="tag">' + esc(r.id) + "</span>" +
       '<span class="spacer"></span>' +
-      '<span class="tag brand">' + esc(r.version) + "</span>" +
+      '<span class="tag">' + esc(r.version) + "</span>" +
       "</div>");
   });
   (env.managers || []).forEach(m => {
@@ -9308,7 +10372,7 @@ function envRows(){
       '<span class="tag">' + esc(m.desc) + "</span>" +
       '<span class="detail" title="' + esc(detail) + '">' + esc(detail) + "</span>" +
       '<span class="spacer"></span>' +
-      '<span class="tag' + (m.available ? " brand" : "") + '">' +
+      '<span class="tag">' +
         (m.available ? "已装" : "未装") + "</span>" +
       "</div>");
   });
@@ -9326,7 +10390,7 @@ function httpRows(){
     return '<div class="row">' +
       '<span class="dot on"></span>' +
       '<span class="name">' + esc(a.vendor) + "</span>" +
-      '<span class="tag brand">' + (a.protocol === "anthropic" ? "Anthropic" : "OpenAI") + "</span>" +
+      '<span class="tag">' + (a.protocol === "anthropic" ? "Anthropic" : "OpenAI") + "</span>" +
       '<span class="tag">仅上下文</span>' +
       '<span class="detail" title="' + esc(names) + '">' + esc(names) + "</span>" +
       '<span class="spacer"></span>' +
@@ -9457,9 +10521,9 @@ document.querySelectorAll("[data-close]").forEach(el => el.onclick = closeEdit);
 $("#toolModal").addEventListener("click", e => { if (e.target.id === "toolModal") closeEdit(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") closeEdit();
-  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3"].includes(e.key)){
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3", "4"].includes(e.key)){
     e.preventDefault();
-    location.href = { "1": "/projects", "2": "/models", "3": "/tools" }[e.key];
+    location.href = { "1": "/projects", "2": "/models", "3": "/tools", "4": "/assets" }[e.key];
   }
 });
 $("#addBtn").onclick = () => openEdit("");
@@ -9492,6 +10556,881 @@ $("#restoreClaudeBtn").onclick = async () => {
 
 refresh();
 setInterval(refresh, 6000);
+</script>
+</body>
+</html>
+"""
+
+ASSETS_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Hub · 资产</title>
+<style>
+  :root{
+    --bg:#F6F8FA; --panel:#FFFFFF; --surface:#ECF0F4;
+    --text:#1E293B; --muted:#64748B; --faint:#94A3B8;
+    --line:#E2E8F0; --line-strong:#CBD5E1;
+    --brand:#475569; --brand-ink:#334155; --brand-soft:#E2E8F0;
+    --ok:#15803D; --ok-soft:#E8F5EC; --off:#94A3B8;
+    --danger:#DC2626; --warn:#B45309;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+    --ease:cubic-bezier(.2,.8,.2,1);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0F172A; --panel:#1E293B; --surface:#334155;
+      --text:#F1F5F9; --muted:#94A3B8; --faint:#64748B;
+      --line:#475569; --line-strong:#64748B;
+      --brand:#CBD5E1; --brand-ink:#E2E8F0; --brand-soft:#334155;
+      --ok:#34D399; --ok-soft:#12261F; --off:#64748B;
+      --danger:#F87171; --warn:#FBBF24;
+    }
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; min-height:100%; background:var(--bg); }
+  body{ color:var(--text); font:14px/1.5 -apple-system,"PingFang SC","Helvetica Neue",sans-serif; }
+  .app{ display:block; height:auto; min-height:100vh; }
+  .rail{
+    display:flex; width:100%; flex:none; height:auto; min-height:56px;
+    flex-direction:row; align-items:center; gap:8px 16px; flex-wrap:wrap;
+    padding:9px 22px; border-bottom:1px solid var(--line);
+    position:sticky; top:0; z-index:20; background:var(--panel);
+  }
+  .brand{ display:flex; align-items:center; gap:9px; padding:0 16px 0 0; font-size:14px; font-weight:650; letter-spacing:-.01em; }
+  .mark{ width:18px; height:18px; border-radius:5px; background:var(--text); position:relative; flex:0 0 auto; }
+  .mark::before{
+    content:""; position:absolute; inset:4px; border-radius:2px;
+    border:1.5px solid var(--panel); border-right-color:transparent; border-bottom-color:transparent;
+  }
+  .mark::after{
+    content:""; position:absolute; right:4px; bottom:4px; width:3px; height:3px;
+    border-radius:1px; background:var(--brand);
+  }
+  .rail-nav{ display:flex; flex-direction:row; gap:4px; }
+  .nav-btn{
+    color:var(--muted); text-decoration:none; font-size:12.5px; font-weight:500;
+    display:flex; align-items:center; gap:7px; padding:7px 12px; border-radius:8px;
+    transition:background 150ms var(--ease), color 150ms var(--ease);
+  }
+  .nav-btn svg{ width:14px; height:14px; flex:0 0 auto; opacity:.8; }
+  .nav-btn:hover{ background:var(--surface); color:var(--text); }
+  .nav-btn.is-active{ background:var(--surface); color:var(--text); font-weight:600; }
+  .nav-btn.is-active svg{ opacity:1; }
+  .nav-btn .kbd{ display:none; }
+  .rail-sep{ width:1px; height:20px; margin:0 2px; background:var(--line); }
+  .sec{ font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); padding:0 6px 0 0; }
+  .rail-foot{ margin:0 0 0 auto; padding:0; border:0; }
+  .foot-line{ font-family:var(--mono); font-size:10px; color:var(--faint); padding:0; }
+  .main{ display:flex; flex:1; min-width:0; min-height:0; flex-direction:column; }
+  .topbar{ display:flex; align-items:center; gap:12px; padding:13px 22px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .topbar h1{ margin:0; font-size:19px; font-weight:600; letter-spacing:-.01em; }
+  .summary{ font-size:12px; color:var(--muted); }
+  .tools{ margin-left:auto; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .btn{
+    appearance:none; border:1px solid var(--line); background:var(--panel); color:var(--text);
+    font:inherit; font-size:12.5px; padding:7px 12px; border-radius:8px; cursor:pointer;
+    text-decoration:none; display:inline-flex; align-items:center; gap:4px;
+    transition:background 150ms var(--ease), border-color 150ms var(--ease), color 150ms var(--ease);
+  }
+  .btn:hover{ background:var(--surface); border-color:var(--line-strong); }
+  .btn:focus-visible, .nav-btn:focus-visible{ outline:2px solid var(--brand-ink); outline-offset:2px; }
+  .page{ flex:1; min-height:0; overflow:auto; padding:22px 22px 48px; }
+  .page > *{ max-width:1240px; margin-left:auto; margin-right:auto; }
+  .empty{
+    text-align:center; color:var(--muted); padding:70px 20px 40px;
+    display:flex; flex-direction:column; align-items:center; gap:10px;
+  }
+  .empty[hidden]{ display:none; }
+  [hidden]{ display:none !important; }
+  .empty-title{ font-size:16px; color:var(--text); font-weight:600; }
+  .empty-sub{ font-size:12.5px; max-width:460px; line-height:1.7; }
+  @media (max-width:900px){
+    .rail{ width:100% !important; padding:9px 14px; }
+    .rail-foot{ display:none; }
+  }
+  @media (prefers-reduced-motion: reduce){ .btn, .nav-btn{ transition-duration:1ms; } }
+  .stats{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:12px; }
+  .stat{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .stat-label{ font-size:11px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; }
+  .stat-value{ font-size:22px; font-weight:600; margin-top:6px; letter-spacing:-.02em; }
+  .stat-sub{ font-size:11.5px; color:var(--muted); margin-top:4px; }
+  .toolbar{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:12px; }
+  .toolbar input,.toolbar select,.field input,.field textarea{ font:inherit; font-size:12.5px; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:7px 9px; }
+  .toolbar input[type=search]{ min-width:170px; }
+  .chips{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+  .chip{ border:1px solid var(--line); background:var(--panel); color:var(--muted); border-radius:999px; padding:5px 11px; font-size:12px; cursor:pointer; }
+  .chip.on{ background:var(--brand-soft); border-color:var(--brand); color:var(--brand-ink); }
+  .progress{ height:4px; background:var(--surface); border-radius:99px; overflow:hidden; width:110px; }
+  .progress > i{ display:block; height:100%; width:35%; background:var(--brand); border-radius:99px; }
+  .panel{ background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  table{ width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td{ text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th{ font-size:11px; color:var(--muted); font-weight:600; background:var(--surface); position:sticky; top:0; }
+  tbody tr:last-child td{ border-bottom:0; }
+  tbody tr:hover{ background:var(--surface); }
+  .num{ font-family:var(--mono); text-align:right; white-space:nowrap; }
+  .path{ font-family:var(--mono); font-size:11px; color:var(--muted); max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tag{ display:inline-block; font-size:10.5px; padding:2px 7px; border-radius:6px; background:var(--surface); color:var(--muted); margin:2px 4px 0 0; }
+  .tag.ai{ background:var(--brand-soft); color:var(--brand-ink); }
+  .tag.warn{ color:var(--warn); }
+  .tag.safe{ color:var(--ok, #15803D); border:1px solid color-mix(in srgb, var(--ok, #15803D) 35%, transparent); }
+  .tag.caution{ color:var(--warn); border:1px solid color-mix(in srgb, var(--warn) 35%, transparent); }
+  .tag.keep{ color:var(--muted); }
+  .reclaim-reason{ font-size:11px; color:var(--muted); line-height:1.45; }
+  .link{ background:none; border:0; padding:0; color:var(--brand-ink); cursor:pointer; font:inherit; text-align:left; }
+  .link:hover{ text-decoration:underline; }
+  .tree{ padding:10px 14px; font-size:12.5px; }
+  .tree details{ margin:3px 0 3px 10px; }
+  .tree summary{ cursor:pointer; color:var(--muted); padding:4px 0; }
+  .tree .leaf{ margin-left:24px; padding:5px 0; border-bottom:1px solid var(--line); }
+  .modal{ position:fixed; inset:0; background:rgba(0,0,0,.35); display:flex; align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal[hidden]{ display:none; }
+  .sheet{ background:var(--panel); border:1px solid var(--line); border-radius:14px; width:min(560px,100%); max-height:86vh; overflow:auto; }
+  .sheet-head{ display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--line); }
+  .sheet-head h3{ margin:0; font-size:15px; }
+  .sheet-body{ padding:16px 18px; display:flex; flex-direction:column; gap:12px; }
+  .field{ display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--muted); }
+  .field textarea{ min-height:90px; resize:vertical; font-family:var(--mono); }
+  .kv{ display:grid; grid-template-columns:88px 1fr; gap:6px 10px; font-size:12.5px; margin:0; }
+  .kv dt{ color:var(--muted); }
+  .kv dd{ margin:0; word-break:break-all; font-family:var(--mono); font-size:11.5px; }
+  .x{ border:0; background:none; color:var(--muted); cursor:pointer; font-size:16px; }
+  #toast{ position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--text); color:var(--panel); padding:9px 16px; border-radius:8px; font-size:12.5px; opacity:0; pointer-events:none; transition:opacity .2s; z-index:60; }
+  #toast.show{ opacity:1; }
+  .more{ display:block; margin:12px auto; }
+  .diff-sheet{ max-width:1000px; --diff-up:#B45309; --diff-down:#15803D; }
+  @media (prefers-color-scheme: dark){ .diff-sheet{ --diff-up:#FBBF24; --diff-down:#34D399; } }
+  .diff-pick{ display:grid; grid-template-columns:1fr 22px 1fr; gap:10px; align-items:end; }
+  .diff-pick select{ font:inherit; font-size:12.5px; color:var(--text); background:var(--panel);
+    border:1px solid var(--line); border-radius:8px; padding:7px 9px; width:100%; }
+  .diff-arrow{ text-align:center; color:var(--muted); padding-bottom:9px; }
+  .diff-snaps{ display:flex; flex-direction:column; gap:5px; max-height:126px; overflow:auto;
+    border:1px solid var(--line); border-radius:10px; padding:8px 10px; }
+  .diff-snap{ display:flex; align-items:center; gap:8px; font-size:12px; }
+  .diff-snap span{ font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .diff-snap .sp{ margin-left:auto; }
+  .diff-snap button{ border:0; background:none; color:var(--danger); cursor:pointer; font-size:11.5px; }
+  .diff-table{ max-height:340px; overflow:auto; }
+  .diff-table td{ font-size:12px; }
+  .diff-up{ color:var(--diff-up); }
+  .diff-down{ color:var(--diff-down); }
+  .diff-new{ color:var(--brand-ink); font-weight:600; }
+  .diff-gone{ color:var(--danger); }
+  .change-list{ font-size:11px; color:var(--muted); line-height:1.6; }
+  .change-list b{ font-weight:600; color:var(--text); }
+  .evidence-box{ border:1px solid var(--line); border-radius:10px; padding:10px 12px; background:var(--surface); }
+  .evidence-head{ display:flex; align-items:center; gap:8px; font-size:12px; margin-bottom:7px; flex-wrap:wrap; }
+  .conf{ font-size:10.5px; padding:2px 7px; border-radius:6px; border:1px solid var(--line); }
+  .conf.high{ color:var(--ok, #15803D); }
+  .conf.medium{ color:var(--warn); }
+  .conf.low,.conf.unknown{ color:var(--muted); }
+  .evidence-row{ display:grid; grid-template-columns:76px 1fr; gap:8px; font-size:11.5px; padding:3px 0; }
+  .evidence-row b{ color:var(--muted); font-weight:500; }
+  .evidence-row span{ word-break:break-all; font-family:var(--mono); }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand"><span class="mark"></span><span>AI Hub</span></div>
+    <div class="rail-nav">
+      <a class="nav-btn" href="/projects">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1.2"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1.2"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1.2"/><rect x="9" y="9" width="4.5" height="4.5" rx="1.2"/></svg>
+        <span>项目</span><span class="kbd">⌘1</span>
+      </a>
+      <a class="nav-btn" href="/models">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5.8" cy="5.8" r="3"/><path d="M8 8l5 5M10.8 10.8l1.4-1.4M12 12l1.4-1.4" stroke-linecap="round"/></svg>
+        <span>模型</span><span class="kbd">⌘2</span>
+      </a>
+      <a class="nav-btn" href="/tools">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 2.5l3 3-2 2-3-3zM8.5 4.5L2.5 10.5v3h3l6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>工具</span><span class="kbd">⌘3</span>
+      </a>
+      <a class="nav-btn is-active" href="/assets">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/><path d="M4.5 5h.01M4.5 11h.01" stroke-linecap="round"/></svg>
+        <span>资产</span><span class="kbd">⌘4</span>
+      </a>
+    </div>
+    <div class="rail-foot"><div class="foot-line">127.0.0.1:8799</div></div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <h1>本机资产</h1>
+      <div class="summary" id="scanInfo">正在读取索引…</div>
+      <div class="tools">
+        <button class="btn" id="btnScan">重新扫描</button>
+        <button class="btn" id="btnConfig">配置目录</button>
+        <button class="btn" id="btnSnapshot">保存快照</button>
+        <button class="btn" id="btnDiff">快照对比</button>
+        <button class="btn" id="btnExport">导出</button>
+      </div>
+    </header>
+    <div class="page">
+      <div class="stats" id="stats"></div>
+      <div class="panel" id="topList" style="padding:12px 14px;margin-bottom:12px"></div>
+      <div class="chips" id="quick">
+        <button class="chip on" data-view="all">全部资产</button>
+        <button class="chip" data-view="ai">AI 相关</button>
+        <button class="chip" data-view="recent">最近 7 天</button>
+        <button class="chip" data-view="big">大件（≥1GB）</button>
+        <button class="chip" data-view="reclaim">可回收</button>
+        <button class="chip" data-view="out">未在 aihub 收录</button>
+      </div>
+      <div class="summary" id="reclaimNote" style="margin:-4px 0 12px">「可回收」只是建议，不会删除任何文件；实际清理需后续版本逐项确认。</div>
+      <div class="toolbar">
+        <input type="search" id="q" placeholder="搜索名称、路径或来源">
+        <select id="fCat"><option value="">全部类别</option></select>
+        <select id="fSource"><option value="">全部来源</option></select>
+        <select id="fAi">
+          <option value="">全部</option><option value="ai">仅 AI 相关</option><option value="non">仅非 AI</option>
+        </select>
+        <select id="fStatus"><option value="">全部状态</option></select>
+        <select id="fHub">
+          <option value="">全部收录状态</option><option value="in">aihub 已收录</option><option value="out">未收录</option>
+        </select>
+        <select id="fSort">
+          <option value="size">按大小</option><option value="name">按名称</option><option value="time">按创建时间</option>
+        </select>
+        <button class="btn" id="btnView">目录树视图</button>
+        <div class="progress" id="prog" hidden><i></i></div>
+        <span class="summary" id="jobText"></span>
+      </div>
+      <div class="panel" id="tableWrap">
+        <table>
+          <thead><tr><th>名称</th><th>类别</th><th class="num">大小</th><th>路径 / 说明</th><th>来源</th><th>状态</th><th>回收建议</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div class="panel tree" id="treeWrap" hidden></div>
+      <button class="btn more" id="btnMore" hidden>显示更多</button>
+      <div class="empty" id="empty" hidden>
+        <div class="empty-title">还没有扫描结果</div>
+        <div class="empty-sub">点右上角「重新扫描」，程序会只读检查本机工具、项目、依赖与缓存，并把结果保存在本机。扫描不会修改或删除任何文件。</div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="modal" id="detail" hidden>
+  <div class="sheet">
+    <div class="sheet-head"><h3>资产详情</h3><button class="x" id="dCloseX">✕</button></div>
+    <div class="sheet-body">
+      <dl class="kv" id="detailKV"></dl>
+      <div class="evidence-box" id="dEvidence"></div>
+      <label class="field">标签（逗号分隔）<input id="dTags" placeholder="例如：常用、待确认"></label>
+      <label class="field">备注<textarea id="dNote" placeholder="只保存在本机"></textarea></label>
+      <label class="check"><input type="checkbox" id="dIgnored"> 在清单中忽略此项</label>
+      <div class="summary" id="dLinks"></div>
+      <div class="tools">
+        <button class="btn" id="dCopy">复制路径</button>
+        <button class="btn" id="dSave">保存标记</button>
+        <button class="btn" id="dClose">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal" id="cfgModal" hidden>
+  <div class="sheet">
+    <div class="sheet-head"><h3>扫描配置</h3><button class="x" id="cfgCloseX">✕</button></div>
+    <div class="sheet-body">
+      <label class="field">扫描根目录（每行一个）<textarea id="cfgRoots"></textarea></label>
+      <label class="field">排除规则（每行一个，支持 * 通配）<textarea id="cfgExclude"></textarea></label>
+      <div class="summary">个人目录默认不扫；填入后才会纳入扫描。保存后点「重新扫描」生效。</div>
+      <div class="tools">
+        <button class="btn" id="cfgSave">保存配置</button>
+        <button class="btn" id="cfgClose">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal" id="diffModal" hidden>
+  <div class="sheet diff-sheet">
+    <div class="sheet-head"><h3>快照差异对比</h3><button class="x" id="diffCloseX">✕</button></div>
+    <div class="sheet-body">
+      <div class="diff-pick">
+        <label class="field">旧快照（基准）<select id="diffBase"></select></label>
+        <div class="diff-arrow">→</div>
+        <label class="field">新快照<select id="diffTarget"></select></label>
+      </div>
+      <div class="tools">
+        <button class="btn" id="diffRun">开始对比</button>
+        <button class="btn" id="diffRefresh">刷新快照列表</button>
+      </div>
+      <div class="diff-snaps" id="diffSnaps"></div>
+      <div class="stats" id="diffStats"></div>
+      <div class="chips" id="diffChips">
+        <button class="chip on" data-kind="all">全部</button>
+        <button class="chip" data-kind="added">新增</button>
+        <button class="chip" data-kind="removed">消失</button>
+        <button class="chip" data-kind="increased">变大</button>
+        <button class="chip" data-kind="decreased">变小</button>
+        <button class="chip" data-kind="changed">属性变化</button>
+      </div>
+      <div class="panel diff-table">
+        <table>
+          <thead><tr><th>名称 / 路径</th><th class="num">变化</th><th>类别</th><th>类型</th><th>变更明细</th></tr></thead>
+          <tbody id="diffRows"></tbody>
+        </table>
+      </div>
+      <div class="summary" id="diffNote"></div>
+      <div class="tools"><button class="btn" id="diffClose">关闭</button></div>
+    </div>
+  </div>
+</div>
+<div class="modal" id="exportModal" hidden>
+  <div class="sheet">
+    <div class="sheet-head"><h3>导出资产清单</h3><button class="x" id="exCloseX">✕</button></div>
+    <div class="sheet-body">
+      <label class="field">范围<select id="exScope">
+        <option value="filtered">当前筛选结果</option><option value="all">全部资产</option>
+      </select></label>
+      <label class="field">格式<select id="exFormat">
+        <option value="csv">CSV（Excel 可直接打开）</option><option value="json">JSON</option>
+      </select></label>
+      <div class="summary" id="exNote"></div>
+      <div class="tools">
+        <button class="btn" id="exRun">下载</button>
+        <button class="btn" id="exClose">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const CATS = { project:"项目", cli:"CLI 工具", runtime:"运行时", dependency:"依赖",
+  model:"模型缓存", container:"容器", service:"后台服务", other:"其他" };
+const STATES = { running:"运行中", available:"已安装", stopped:"已停止", missing:"已失效", unknown:"未知" };
+const PAGES = { projects:"项目页", tools:"工具页", models:"模型页" };
+let data = { items:[], summary:{}, updated:0, config:{roots:[],exclude:[]} };
+let quick = "all", viewMode = "table", limit = 200, current = null;
+let jobTimer = null, toastTimer = null;
+let snaps = [], diffData = null, diffKind = "all";
+
+async function api(url, body){
+  const opt = body === undefined ? {} : {
+    method:"POST", headers:{ "Content-Type":"application/json", "X-AIHub":"1" }, body:JSON.stringify(body)
+  };
+  const res = await fetch(url, opt);
+  return await res.json();
+}
+function fmtSize(b){
+  b = Number(b) || 0;
+  const units = ["B","KB","MB","GB","TB"];
+  let i = 0, v = b;
+  while (v >= 1024 && i < units.length - 1){ v /= 1024; i++; }
+  return (i === 0 ? Math.round(v) : v.toFixed(v >= 100 ? 0 : 1)) + " " + units[i];
+}
+function fmtUpdated(ts){
+  if (!ts) return "尚无扫描结果";
+  try { return new Date(ts * 1000).toLocaleString("zh-CN", { hour12:false }); }
+  catch(e){ return "时间未知"; }
+}
+function toast(msg){
+  const el = $("#toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 3200);
+}
+function fmtDiffSize(b, signed){
+  const n = Number(b) || 0;
+  const sign = signed && n > 0 ? "+" : (signed && n < 0 ? "−" : "");
+  return sign + fmtSize(Math.abs(n));
+}
+function fmtSnapTime(ts){
+  if (!ts) return "时间未知";
+  try { return new Date(ts * 1000).toLocaleString("zh-CN", { hour12:false }); }
+  catch(e){ return "时间未知"; }
+}
+function snapLabel(s){
+  return fmtSnapTime(s.created) + " · " + (s.count || 0) + " 项";
+}
+function fillSnapSelects(){
+  const bs = $("#diffBase"), ts = $("#diffTarget");
+  const oldBase = bs.value, oldTarget = ts.value;
+  const opts = snaps.map(s => '<option value="' + esc(s.name) + '">' + esc(snapLabel(s)) + '</option>').join("");
+  bs.innerHTML = opts || '<option value="">（暂无快照）</option>';
+  ts.innerHTML = opts + '<option value="current">当前清单</option>';
+  const hasBase = snaps.some(s => s.name === oldBase);
+  bs.value = hasBase ? oldBase : (snaps[0] ? snaps[0].name : "");
+  ts.value = (oldTarget === "current" || snaps.some(s => s.name === oldTarget)) ? oldTarget : "current";
+}
+function renderSnapList(){
+  const box = $("#diffSnaps");
+  if (!snaps.length){
+    box.innerHTML = '<div class="summary">还没有快照。点右上角「保存快照」先留一份基线。</div>';
+    return;
+  }
+  box.innerHTML = snaps.map(s =>
+    '<div class="diff-snap"><b>' + esc(s.name.replace(/\.json$/, "")) + '</b>' +
+    '<span>' + esc(snapLabel(s)) + '</span><span class="sp">' + fmtSize(s.file_size) + '</span>' +
+    '<button type="button" data-name="' + esc(s.name) + '">删除</button></div>').join("");
+  box.querySelectorAll("button[data-name]").forEach(btn => {
+    btn.onclick = async () => {
+      if (!window.confirm("删除快照 " + btn.dataset.name + "？删除后无法恢复。")) return;
+      const r = await api("/api/assets/snapshot/delete", { name:btn.dataset.name });
+      toast(r.message || (r.ok ? "快照已删除" : "删除失败"));
+      await loadSnapshots();
+      if (!$("#diffModal").hidden) await runDiff();
+    };
+  });
+}
+async function loadSnapshots(){
+  try{
+    const r = await api("/api/assets/snapshots");
+    snaps = r.snapshots || [];
+  }catch(e){ snaps = []; }
+  fillSnapSelects();
+  renderSnapList();
+}
+function changesHtml(row){
+  if (row.kind === "added") return '<b>新出现</b> · ' + fmtSize(row.after && row.after.size);
+  if (row.kind === "removed") return '<b>已消失</b> · 原 ' + fmtSize(row.before && row.before.size);
+  if (!row.changes || !row.changes.length) return "—";
+  return row.changes.map(c => {
+    let a = c.before, b = c.after;
+    if (c.field === "size"){ a = fmtSize(a); b = fmtSize(b); }
+    if (typeof a === "boolean") a = a ? "是" : "否";
+    if (typeof b === "boolean") b = b ? "是" : "否";
+    return '<div><b>' + esc(c.label) + '</b> ' + esc(a) + ' → ' + esc(b) + '</div>';
+  }).join("");
+}
+function renderDiff(){
+  const stats = $("#diffStats"), rowsEl = $("#diffRows"), note = $("#diffNote");
+  if (!diffData){
+    stats.innerHTML = "";
+    rowsEl.innerHTML = '<tr><td colspan="5" class="summary" style="text-align:center;padding:26px">选择对比对象后点「开始对比」</td></tr>';
+    note.textContent = "按资产路径匹配；大小变化小于 1KB 视为噪声。快照仅保存在本机。";
+    return;
+  }
+  const s = diffData.summary;
+  const cards = [
+    ["新增", s.added, fmtSize(s.added_size), "diff-new"],
+    ["消失", s.removed, fmtSize(s.removed_size), "diff-gone"],
+    ["变大", s.increased, "", "diff-up"],
+    ["变小", s.decreased, "", "diff-down"],
+    ["属性变化", s.changed, "", ""],
+    ["空间净变化", s.size_delta, fmtDiffSize(s.size_delta, true),
+      s.size_delta > 0 ? "diff-up" : (s.size_delta < 0 ? "diff-down" : "")],
+  ];
+  stats.innerHTML = cards.map(c => {
+    const sub = c[0] === "空间净变化"
+      ? "基准 " + fmtSize(s.total_before) + " → 当前 " + fmtSize(s.total_after)
+      : (c[2] ? c[1] + " 项" : "项");
+    return '<div class="stat"><div class="stat-label">' + esc(c[0]) + '</div>' +
+      '<div class="stat-value ' + c[3] + '">' + esc(c[2] || c[1]) + '</div>' +
+      '<div class="stat-sub">' + esc(sub) + '</div></div>';
+  }).join("");
+  const list = diffData.rows.filter(r => diffKind === "all" || r.kind === diffKind);
+  if (!list.length){
+    rowsEl.innerHTML = '<tr><td colspan="5" class="summary" style="text-align:center;padding:26px">没有符合条件的差异</td></tr>';
+  } else {
+    const kindLabel = { added:"新增", removed:"消失", increased:"变大", decreased:"变小", changed:"属性变化" };
+    const kindClass = { added:"diff-new", removed:"diff-gone", increased:"diff-up", decreased:"diff-down", changed:"" };
+    rowsEl.innerHTML = list.map(r => {
+      const kc = kindClass[r.kind] || "";
+      let delta = "—";
+      if (r.kind === "added") delta = fmtSize(r.after && r.after.size);
+      else if (r.kind === "removed") delta = "-" + fmtSize(r.before && r.before.size);
+      else if (r.delta) delta = fmtDiffSize(r.delta, true);
+      return '<tr><td><div class="' + kc + '">' + esc(r.name) + '</div>' +
+        '<div class="path">' + esc(r.path || "—") + '</div></td>' +
+        '<td class="num ' + kc + '">' + esc(delta) + '</td>' +
+        '<td>' + esc(CATS[r.category] || r.category) + '</td>' +
+        '<td class="' + kc + '">' + esc(kindLabel[r.kind] || r.kind) + '</td>' +
+        '<td class="change-list">' + changesHtml(r) + '</td></tr>';
+    }).join("");
+  }
+  note.textContent = "基准：" + fmtSnapTime(diffData.base_time) + " · 对比：" + fmtSnapTime(diffData.target_time) +
+    " · 按资产路径匹配，小于 1KB 的大小变化视为噪声" +
+    (diffData.truncated ? " · 仅展示前 1000 项" : "") + "。快照仅保存在本机。";
+}
+async function runDiff(){
+  const base = $("#diffBase").value, target = $("#diffTarget").value;
+  if (!base || !target){ toast("请先保存至少一份快照"); return; }
+  $("#diffRun").disabled = true;
+  try{
+    const r = await api("/api/assets/diff?base=" + encodeURIComponent(base) + "&target=" + encodeURIComponent(target));
+    if (!r.ok){
+      diffData = null;
+      toast(r.message || "对比失败");
+    } else {
+      diffData = r;
+      diffKind = "all";
+      document.querySelectorAll("#diffChips .chip").forEach(c => c.classList.toggle("on", c.dataset.kind === "all"));
+      toast("对比完成：" + r.rows.length + " 项变化");
+    }
+    renderDiff();
+  }catch(e){ toast("对比请求失败"); }
+  finally{ $("#diffRun").disabled = false; }
+}
+const CONF_LABEL = { high:"高", medium:"中", low:"低", unknown:"未知" };
+const RECLAIM_LABEL = { safe:"可回收", caution:"谨慎回收", keep:"不建议回收", unknown:"待确认" };
+const AI_LABEL = { yes:"是", unknown:"未知", no:"否" };
+function aiLabel(i){
+  return AI_LABEL[i.ai_state] || (i.ai_related ? "是" : "否");
+}
+function evidenceHtml(rec){
+  const conf = rec.confidence || "unknown";
+  const items = (rec.evidence_items || []).map(e =>
+    '<div class="evidence-row"><b>' + esc(e.label) + '</b><span>' + esc(e.value) + '</span></div>').join("");
+  return '<div class="evidence-box"><div class="evidence-head"><span>来源证据链</span>' +
+    '<span class="conf ' + conf + '">置信度 ' +
+    esc(rec.confidence_label || CONF_LABEL[conf] || "未知") + '</span>' +
+    '<span class="summary">AI 相关：' + aiLabel(rec) + '</span></div>' +
+    (items || '<div class="summary">暂无证据</div>') + '</div>';
+}
+const EXPORT_FIELDS = [
+  ["name","名称"], ["category","类别"], ["path","路径"], ["real_path","真实路径"],
+  ["size","大小（字节）"], ["file_count","文件数"], ["source","发现来源"], ["evidence","判定依据"],
+  ["confidence_label","置信度"], ["status","状态"], ["created","创建时间"], ["modified","修改时间"],
+  ["aihub_page","关联页面"], ["entity_id","关联ID"], ["tags","标签"], ["note","备注"], ["ignored","已忽略"],
+  ["reclaimable_size","可回收大小（字节）"], ["reclaim_label","回收建议"], ["reclaim_reason","建议原因"]
+];
+function csvCell(v){
+  let s = v == null ? "" : String(v);
+  if (/[",\\n\\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function downloadText(text, name, mime){
+  const blob = new Blob([text], { type:mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function updateExportNote(){
+  const n = $("#exScope").value === "all" ? (data.items || []).length : filtered().length;
+  $("#exNote").textContent = "将导出 " + n +
+    " 项资产到本机文件，不联网。证据链已脱敏；路径保留完整本机路径，请妥善保管文件。";
+}
+function runExport(){
+  const scope = $("#exScope").value, format = $("#exFormat").value;
+  const arr = scope === "all" ? (data.items || []).slice() : filtered();
+  const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g, "-");
+  if (format === "json"){
+    const out = arr.map(i => {
+      const o = {};
+      EXPORT_FIELDS.forEach(f => {
+        o[f[1]] = f[0] === "tags" ? (i.tags || []).join(", ")
+          : (f[0] === "ignored" ? (i.ignored ? "是" : "否")
+          : (i[f[0]] == null ? "" : i[f[0]]));
+      });
+      o["AI 相关"] = aiLabel(i);
+      o["证据链"] = (i.evidence_items || []).map(e => e.label + "：" + e.value).join("；");
+      return o;
+    });
+    downloadText(JSON.stringify(out, null, 2), "aihub-assets-" + stamp + ".json",
+      "application/json;charset=utf-8");
+  } else {
+    const head = EXPORT_FIELDS.map(f => f[1]).concat(["AI 相关", "证据链"]);
+    const lines = [head.map(csvCell).join(",")];
+    arr.forEach(i => {
+      const vals = EXPORT_FIELDS.map(f => {
+        const v = f[0] === "tags" ? (i.tags || []).join(", ")
+          : (f[0] === "ignored" ? (i.ignored ? "是" : "否")
+          : (i[f[0]] == null ? "" : i[f[0]]));
+        return csvCell(v);
+      });
+      vals.push(csvCell(aiLabel(i)));
+      vals.push(csvCell((i.evidence_items || []).map(e => e.label + "：" + e.value).join("；")));
+      lines.push(vals.join(","));
+    });
+    downloadText("\\ufeff" + lines.join("\\r\\n"), "aihub-assets-" + stamp + ".csv",
+      "text/csv;charset=utf-8");
+  }
+  $("#exportModal").hidden = true;
+  toast("已导出 " + arr.length + " 项资产");
+}
+function fillSelect(sel, values, labelMap, firstLabel){
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">' + firstLabel + '</option>' + values.map(v =>
+    '<option value="' + esc(v) + '">' + esc((labelMap && labelMap[v]) || v) + '</option>').join("");
+  sel.value = cur;
+}
+function fillFilters(){
+  const cats = [], sources = [], states = [];
+  (data.items || []).forEach(i => {
+    if (i.category && cats.indexOf(i.category) < 0) cats.push(i.category);
+    if (i.source && sources.indexOf(i.source) < 0) sources.push(i.source);
+    if (i.status && states.indexOf(i.status) < 0) states.push(i.status);
+  });
+  fillSelect($("#fCat"), cats, CATS, "全部类别");
+  fillSelect($("#fSource"), sources, null, "全部来源");
+  fillSelect($("#fStatus"), states, STATES, "全部状态");
+}
+function filtered(){
+  const q = ($("#q").value || "").toLowerCase().trim();
+  const cat = $("#fCat").value, src = $("#fSource").value, ai = $("#fAi").value;
+  const st = $("#fStatus").value, hub = $("#fHub").value, sort = $("#fSort").value;
+  let arr = (data.items || []).filter(i => {
+    if (i.ignored) return false;
+    if (q && (i.name + " " + i.path + " " + i.source + " " + i.evidence).toLowerCase().indexOf(q) < 0) return false;
+    if (cat && i.category !== cat) return false;
+    if (src && i.source !== src) return false;
+    if (ai === "ai" && !i.ai_related) return false;
+    if (ai === "non" && i.ai_related) return false;
+    if (st && i.status !== st) return false;
+    if (hub === "in" && !i.in_aihub) return false;
+    if (hub === "out" && i.in_aihub) return false;
+    return true;
+  });
+  if (quick === "ai") arr = arr.filter(i => i.ai_related);
+  if (quick === "recent") arr = arr.filter(i => i.created_ts && Date.now() / 1000 - i.created_ts <= 7 * 86400);
+  if (quick === "big") arr = arr.filter(i => Number(i.size) >= 1024 * 1024 * 1024);
+  if (quick === "reclaim") arr = arr.filter(i => Number(i.reclaimable_size) > 0);
+  if (quick === "out") arr = arr.filter(i => !i.in_aihub);
+  if (sort === "name") arr.sort((a,b) => String(a.name).localeCompare(String(b.name)));
+  else if (sort === "time") arr.sort((a,b) => (b.created_ts||0) - (a.created_ts||0));
+  else arr.sort((a,b) => (Number(b.size)||0) - (Number(a.size)||0));
+  return arr;
+}
+function renderStats(){
+  const s = data.summary || {};
+  const cards = [
+    ["总占用", fmtSize(s.total_size), "共 " + (s.count||0) + " 项资产"],
+    ["aihub 已收录", String(s.in_aihub_count||0), "项目 / 工具 / 运行时"],
+    ["AI 相关", String(s.ai_count||0), "只是一个筛选标签"],
+    ["近 7 天新增", String(s.recent_count||0), "按创建时间推测"],
+    ["可回收建议", fmtSize(s.reclaim_size),
+      (s.reclaim_count||0) + " 项 · 稳妥 " + fmtSize(s.reclaim_safe_size) +
+      " / 谨慎 " + fmtSize(s.reclaim_caution_size)]
+  ];
+  $("#stats").innerHTML = cards.map(c =>
+    '<div class="stat"><div class="stat-label">' + c[0] + '</div><div class="stat-value">' +
+    esc(c[1]) + '</div><div class="stat-sub">' + esc(c[2]) + '</div></div>').join("");
+  const top = s.top || [];
+  $("#topList").innerHTML = '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">占用 Top 10</div>' +
+    (top.length ? top.map((t,idx) =>
+      '<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0;font-size:12px">' +
+      '<span>' + (idx+1) + '. ' + esc(t.name) + '</span><span class="num">' + fmtSize(t.size) + '</span></div>').join("")
+      : '<div class="summary">暂无数据</div>');
+}
+function renderTable(items){
+  const shown = items.slice(0, limit);
+  $("#rows").innerHTML = shown.map(i => {
+    const tags = (i.tags || []).map(t => '<span class="tag">' + esc(t) + '</span>').join("");
+    const ai = i.ai_related ? '<span class="tag ai">AI</span>' : '';
+    const warn = i.truncated ? '<span class="tag warn">大小估算</span>' : '';
+    const rl = i.reclaim_level || "unknown";
+    const reclaim = (rl === "safe" || rl === "caution")
+      ? '<span class="tag ' + rl + '">' + esc(i.reclaim_label || RECLAIM_LABEL[rl]) + '</span>' +
+        '<div class="reclaim-reason">' + esc(i.reclaim_reason || "") + '</div>'
+      : '<span class="tag keep">' + esc(i.reclaim_label || RECLAIM_LABEL[rl]) + '</span>';
+    const desc = i.path || i.evidence || i.note || "";
+    return '<tr>' +
+      '<td><button class="link" data-id="' + esc(i.id) + '">' + esc(i.name) + '</button>' + ai + tags + warn + '</td>' +
+      '<td>' + esc(CATS[i.category] || i.category || "其他") + '</td>' +
+      '<td class="num">' + fmtSize(i.size) + '</td>' +
+      '<td><div class="path" title="' + esc(desc) + '">' + esc(desc) + '</div></td>' +
+      '<td>' + esc(i.source || "未知") +
+        ((i.confidence === "low" || i.confidence === "unknown")
+          ? ' <span class="conf ' + (i.confidence || "unknown") + '">' +
+            esc(CONF_LABEL[i.confidence] || "未知") + '</span>' : '') + '</td>' +
+      '<td>' + esc(STATES[i.status] || i.status || "未知") + '</td>' +
+      '<td>' + reclaim + '</td></tr>';
+  }).join("");
+  document.querySelectorAll("#rows .link").forEach(btn => {
+    btn.onclick = () => openDetail(btn.dataset.id);
+  });
+  $("#btnMore").hidden = items.length <= limit;
+}
+function renderTree(items){
+  const groups = {};
+  items.forEach(i => {
+    const key = CATS[i.category] || i.category || "其他";
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(i);
+  });
+  $("#treeWrap").innerHTML = Object.keys(groups).map(k =>
+    '<details open><summary>' + esc(k) + ' · ' + groups[k].length + ' 项</summary>' +
+    groups[k].map(i => '<div class="leaf"><button class="link" data-id="' + esc(i.id) + '">' +
+      esc(i.name) + '</button> <span class="num">' + fmtSize(i.size) + '</span>' +
+      (Number(i.reclaimable_size) > 0
+        ? ' <span class="tag ' + esc(i.reclaim_level || "") + '">' +
+          esc(i.reclaim_label || RECLAIM_LABEL[i.reclaim_level] || "") + '</span>' : '') +
+      '<div class="path">' + esc(i.path || i.evidence) + '</div></div>').join("") + '</details>').join("");
+  document.querySelectorAll("#treeWrap .link").forEach(btn => {
+    btn.onclick = () => openDetail(btn.dataset.id);
+  });
+}
+function render(){
+  const items = filtered();
+  renderStats();
+  const hasData = (data.items || []).length > 0;
+  $("#empty").hidden = hasData;
+  $("#tableWrap").hidden = !hasData || viewMode !== "table";
+  $("#treeWrap").hidden = !hasData || viewMode !== "tree";
+  $("#btnMore").hidden = viewMode !== "table" || items.length <= limit;
+  if (viewMode === "tree") renderTree(items);
+  else renderTable(items);
+}
+function openDetail(id){
+  current = (data.items || []).find(x => x.id === id) || null;
+  if (!current) return;
+  const rows = [
+    ["名称", current.name], ["类别", CATS[current.category] || current.category],
+    ["大小", fmtSize(current.size) + "（" + (current.file_count||0) + " 个文件" + (current.truncated?"，部分统计":"") + "）"],
+    ["路径", current.path || "（无本地路径）"], ["真实路径", current.real_path || "—"],
+    ["来源", current.source || "未知"], ["依据", current.evidence || "—"],
+    ["AI 相关", current.ai_related ? "是" : "否"],
+    ["aihub 收录", current.in_aihub ? "已收录" : "未收录"],
+    ["状态", STATES[current.status] || current.status || "未知"],
+    ["创建 / 修改", (current.created || "未知") + " / " + (current.modified || "未知")],
+    ["风险", current.risk || "low"],
+    ["可回收大小", current.reclaimable_size ? fmtSize(current.reclaimable_size) : "0 B"],
+    ["回收建议", (current.reclaim_label || "待确认") + "：" + (current.reclaim_reason || "暂无说明")]
+  ];
+  $("#detailKV").innerHTML = rows.map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join("");
+  $("#dEvidence").innerHTML = evidenceHtml(current);
+  $("#dTags").value = (current.tags || []).join(", ");
+  $("#dNote").value = current.note || "";
+  $("#dIgnored").checked = !!current.ignored;
+  const page = current.aihub_page || "";
+  const href = page.charAt(0) === "/" ? page : "/" + page;
+  $("#dLinks").innerHTML = (current.in_aihub && page
+    ? '<a href="' + esc(href) + '">打开「' + esc(PAGES[page] || page) +
+      '」</a> · 关联 ID：' + esc(current.entity_id || "—")
+    : "该资产尚未在 aihub 中登记") +
+    '<div class="summary" style="margin-top:6px">回收建议仅供参考，当前版本不会删除任何文件。</div>';
+  $("#detail").hidden = false;
+}
+function closeDetail(){ $("#detail").hidden = true; current = null; }
+function pollJob(id){
+  clearInterval(jobTimer);
+  jobTimer = setInterval(async () => {
+    try {
+      const j = await api("/api/assets/job?id=" + encodeURIComponent(id || ""));
+      $("#prog").hidden = false;
+      $("#jobText").textContent = j.step || "";
+      if (j.status === "done" || j.status === "error"){
+        clearInterval(jobTimer);
+        $("#prog").hidden = true;
+        toast(j.message || "扫描结束");
+        await load();
+      }
+    } catch(e){ clearInterval(jobTimer); $("#prog").hidden = true; }
+  }, 1500);
+}
+async function load(){
+  try {
+    const d = await api("/api/assets");
+    data = d;
+    $("#scanInfo").textContent = "索引更新：" + fmtUpdated(d.updated);
+    fillFilters();
+    render();
+  } catch(e){ toast("读取资产索引失败"); }
+}
+$("#q").oninput = render;
+["fCat","fSource","fAi","fStatus","fHub","fSort"].forEach(id => {
+  $("#" + id).onchange = render;
+});
+document.querySelectorAll("#quick .chip").forEach(chip => {
+  chip.onclick = () => {
+    document.querySelectorAll("#quick .chip").forEach(c => c.classList.remove("on"));
+    chip.classList.add("on");
+    quick = chip.dataset.view;
+    limit = 200;
+    render();
+  };
+});
+$("#btnView").onclick = () => {
+  viewMode = viewMode === "table" ? "tree" : "table";
+  $("#btnView").textContent = viewMode === "table" ? "目录树视图" : "表格视图";
+  render();
+};
+$("#btnMore").onclick = () => { limit += 200; render(); };
+$("#btnScan").onclick = async () => {
+  try {
+    const r = await api("/api/assets/scan", {});
+    toast(r.message || "已触发扫描");
+    pollJob(r.id);
+  } catch(e){ toast("启动扫描失败"); }
+};
+$("#btnConfig").onclick = () => {
+  const cfg = data.config || { roots:[], exclude:[] };
+  $("#cfgRoots").value = (cfg.roots || []).join("\n");
+  $("#cfgExclude").value = (cfg.exclude || []).join("\n");
+  $("#cfgModal").hidden = false;
+};
+$("#cfgClose").onclick = $("#cfgCloseX").onclick = () => { $("#cfgModal").hidden = true; };
+$("#cfgSave").onclick = async () => {
+  const r = await api("/api/assets/config", {
+    roots: $("#cfgRoots").value.split("\n"),
+    exclude: $("#cfgExclude").value.split("\n")
+  });
+  $("#cfgModal").hidden = true;
+  toast(r.ok ? "配置已保存，请重新扫描" : "保存失败");
+  await load();
+};
+$("#btnSnapshot").onclick = async () => {
+  const r = await api("/api/assets/snapshot", {});
+  toast(r.message || (r.ok ? "快照已保存" : "保存失败"));
+  if (r.ok && !$("#diffModal").hidden) await loadSnapshots();
+};
+$("#btnDiff").onclick = async () => {
+  $("#diffModal").hidden = false;
+  diffData = null;
+  diffKind = "all";
+  document.querySelectorAll("#diffChips .chip").forEach(c => c.classList.toggle("on", c.dataset.kind === "all"));
+  renderDiff();
+  await loadSnapshots();
+  if (snaps.length) await runDiff();
+};
+$("#diffRun").onclick = runDiff;
+$("#diffRefresh").onclick = async () => { await loadSnapshots(); toast("快照列表已刷新"); };
+$("#diffClose").onclick = $("#diffCloseX").onclick = () => { $("#diffModal").hidden = true; };
+$("#btnExport").onclick = () => {
+  $("#exScope").value = "filtered";
+  $("#exFormat").value = "csv";
+  updateExportNote();
+  $("#exportModal").hidden = false;
+};
+$("#exScope").onchange = updateExportNote;
+$("#exRun").onclick = runExport;
+$("#exClose").onclick = $("#exCloseX").onclick = () => { $("#exportModal").hidden = true; };
+document.querySelectorAll("#diffChips .chip").forEach(chip => {
+  chip.onclick = () => {
+    diffKind = chip.dataset.kind;
+    document.querySelectorAll("#diffChips .chip").forEach(c => c.classList.remove("on"));
+    chip.classList.add("on");
+    renderDiff();
+  };
+});
+$("#dClose").onclick = $("#dCloseX").onclick = closeDetail;
+$("#dCopy").onclick = async () => {
+  if (!current || !current.path) return toast("该项没有本地路径");
+  try { await navigator.clipboard.writeText(current.path); toast("路径已复制"); }
+  catch(e){ toast("复制失败，请手动选择路径"); }
+};
+$("#dSave").onclick = async () => {
+  if (!current) return;
+  const id = current.id;
+  await api("/api/assets/ignore", { id:id, ignored:$("#dIgnored").checked });
+  await api("/api/assets/tag", { id:id, tags:$("#dTags").value });
+  await api("/api/assets/note", { id:id, note:$("#dNote").value });
+  closeDetail();
+  toast("标记已保存");
+  await load();
+};
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape"){
+    closeDetail();
+    $("#cfgModal").hidden = true;
+    $("#diffModal").hidden = true;
+    $("#exportModal").hidden = true;
+  }
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && ["1", "2", "3", "4"].includes(e.key)){
+    e.preventDefault();
+    location.href = { "1": "/projects", "2": "/models", "3": "/tools", "4": "/assets" }[e.key];
+  }
+});
+load();
+api("/api/assets/job").then(j => { if (j && j.status === "running") pollJob(j.id); }).catch(() => {});
 </script>
 </body>
 </html>
